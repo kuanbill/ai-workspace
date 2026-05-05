@@ -1,0 +1,8 @@
+streamlit
+customtkinter
+openai
+anthropic
+python-dotenv
+sqlalchemy
+requests
+pyinstaller
