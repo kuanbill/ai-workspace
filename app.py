@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from datetime import datetime
@@ -63,6 +64,15 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS settings
            (key TEXT PRIMARY KEY,
             value TEXT)"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS user_projects
+           (id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            name TEXT,
+            folder_path TEXT,
+            created_at TEXT,
+            UNIQUE(user_id, folder_path))"""
     )
     conn.commit()
     conn.close()
@@ -198,8 +208,38 @@ def delete_user(user_id):
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE id = ?", (user_id,))
     c.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+    c.execute("DELETE FROM user_projects WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
+
+
+def get_projects(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM user_projects WHERE user_id = ? ORDER BY created_at DESC",
+        (user_id,),
+    )
+    projects = c.fetchall()
+    conn.close()
+    return projects
+
+
+def add_project_folder(user_id, folder_path):
+    normalized_path = os.path.normpath(folder_path)
+    project_name = os.path.basename(normalized_path.rstrip("\\/")) or normalized_path
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO user_projects (user_id, name, folder_path, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (user_id, project_name, normalized_path, datetime.now().isoformat()),
+    )
+    project_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return project_id
 
 
 def get_conversations(user_id):
@@ -582,40 +622,196 @@ class AIPlatformApp(ctk.CTk):
 
         self.current_user = None
         self.current_conversation = None
+        self.current_project = None
         self.selected_file = None
+        self.history_expanded = False
+        self.history_manage_mode = False
 
         self.setup_ui()
 
     def setup_ui(self):
+        self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=0)
+        self.grid_rowconfigure(1, weight=1)
 
-        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
-        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.topbar = ctk.CTkFrame(self, height=72, corner_radius=0, fg_color="#1b1b1d")
+        self.topbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.topbar.grid_columnconfigure(1, weight=1)
 
-        self.btn_chat = ctk.CTkButton(self.sidebar, text="AI 對話", command=self.show_chat)
-        self.btn_chat.pack(padx=20, pady=20, fill="x")
+        self.topbar_title = ctk.CTkLabel(
+            self.topbar,
+            text="AI 協作平台",
+            font=ctk.CTkFont(size=20, weight="bold"),
+        )
+        self.topbar_title.grid(row=0, column=0, padx=(18, 12), pady=14, sticky="w")
 
-        self.btn_users = ctk.CTkButton(self.sidebar, text="使用者資料", command=self.show_users)
-        self.btn_users.pack(padx=20, pady=20, fill="x")
+        self.nav_frame = ctk.CTkFrame(self.topbar, fg_color="transparent")
+        self.nav_frame.grid(row=0, column=1, padx=10, pady=12, sticky="w")
 
-        self.btn_settings = ctk.CTkButton(self.sidebar, text="系統設定", command=self.show_settings)
-        self.btn_settings.pack(padx=20, pady=20, fill="x")
+        self.btn_chat = ctk.CTkButton(self.nav_frame, text="AI 對話", width=110, command=self.show_chat)
+        self.btn_chat.pack(side="left", padx=6)
 
-        self.btn_knowledge = ctk.CTkButton(self.sidebar, text="知識庫", command=self.show_knowledge)
-        self.btn_knowledge.pack(padx=20, pady=20, fill="x")
+        self.btn_users = ctk.CTkButton(self.nav_frame, text="使用者資料", width=110, command=self.show_users)
+        self.btn_users.pack(side="left", padx=6)
 
-        self.btn_tools = ctk.CTkButton(self.sidebar, text="AI Tools", command=self.show_tools)
-        self.btn_tools.pack(padx=20, pady=20, fill="x")
+        self.btn_settings = ctk.CTkButton(self.nav_frame, text="系統設定", width=110, command=self.show_settings)
+        self.btn_settings.pack(side="left", padx=6)
+
+        self.btn_knowledge = ctk.CTkButton(self.nav_frame, text="知識庫", width=110, command=self.show_knowledge)
+        self.btn_knowledge.pack(side="left", padx=6)
+
+        self.btn_tools = ctk.CTkButton(self.nav_frame, text="AI Tools", width=110, command=self.show_tools)
+        self.btn_tools.pack(side="left", padx=6)
+
+        self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color="#171718")
+        self.sidebar.grid(row=1, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(3, weight=1)
+        self.sidebar.grid_propagate(False)
+
+        self.project_title = ctk.CTkLabel(
+            self.sidebar,
+            text="使用者專案",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        )
+        self.project_title.grid(row=0, column=0, padx=16, pady=(18, 8), sticky="w")
+
+        self.project_user_label = ctk.CTkLabel(self.sidebar, text="目前使用者: 未選擇", text_color="#b8b8b8")
+        self.project_user_label.grid(row=1, column=0, padx=16, pady=(0, 8), sticky="w")
+
+        self.btn_add_project = ctk.CTkButton(
+            self.sidebar,
+            text="新增專案資料夾",
+            command=self.add_project_folder_from_dialog,
+        )
+        self.btn_add_project.grid(row=2, column=0, padx=16, pady=(0, 12), sticky="ew")
+
+        self.project_list_frame = ctk.CTkScrollableFrame(self.sidebar, corner_radius=10)
+        self.project_list_frame.grid(row=3, column=0, padx=12, pady=(0, 8), sticky="nsew")
+
+        self.project_status_label = ctk.CTkLabel(self.sidebar, text="", text_color="#8f8f8f", justify="left")
+        self.project_status_label.grid(row=4, column=0, padx=16, pady=(0, 16), sticky="ew")
 
         self.main_frame = ctk.CTkFrame(self, corner_radius=0)
-        self.main_frame.grid(row=0, column=1, sticky="nsew")
+        self.main_frame.grid(row=1, column=1, sticky="nsew")
 
         self.show_chat()
+        self.refresh_project_sidebar()
 
     def clear_main(self):
         for widget in self.main_frame.winfo_children():
             widget.destroy()
+
+    def ensure_current_user(self):
+        users = get_users()
+        if self.current_user:
+            for user in users:
+                if user[0] == self.current_user[0]:
+                    self.current_user = user
+                    return self.current_user
+
+        self.current_user = users[0] if users else None
+        return self.current_user
+
+    def set_active_nav(self, active_name):
+        nav_buttons = {
+            "chat": self.btn_chat,
+            "users": self.btn_users,
+            "settings": self.btn_settings,
+            "knowledge": self.btn_knowledge,
+            "tools": self.btn_tools,
+        }
+        for name, button in nav_buttons.items():
+            if name == active_name:
+                button.configure(fg_color="#2f7dc0")
+            else:
+                button.configure(fg_color=["#3a7ebf", "#1f538d"])
+
+    def select_project(self, project):
+        self.current_project = project
+        self.refresh_project_sidebar()
+
+    def refresh_project_sidebar(self):
+        self.ensure_current_user()
+
+        for widget in self.project_list_frame.winfo_children():
+            widget.destroy()
+
+        if not self.current_user:
+            self.project_user_label.configure(text="目前使用者: 未選擇")
+            self.project_status_label.configure(text="請先建立使用者後再新增專案資料夾", text_color="orange")
+            self.btn_add_project.configure(state="disabled")
+            empty_label = ctk.CTkLabel(self.project_list_frame, text="尚無使用者", text_color="#9f9f9f")
+            empty_label.pack(anchor="w", padx=8, pady=8)
+            return
+
+        self.project_user_label.configure(text=f"目前使用者: {self.current_user[1]}")
+        self.btn_add_project.configure(state="normal")
+
+        projects = get_projects(self.current_user[0])
+        if self.current_project and self.current_project[0] not in [project[0] for project in projects]:
+            self.current_project = None
+        if not self.current_project and projects:
+            self.current_project = projects[0]
+
+        if not projects:
+            self.project_status_label.configure(text="尚未建立專案資料夾", text_color="#9f9f9f")
+            empty_label = ctk.CTkLabel(self.project_list_frame, text="尚無專案資料夾", text_color="#9f9f9f")
+            empty_label.pack(anchor="w", padx=8, pady=8)
+            return
+
+        for project in projects:
+            is_active = self.current_project and self.current_project[0] == project[0]
+            item_frame = ctk.CTkFrame(
+                self.project_list_frame,
+                fg_color="#244e73" if is_active else "#232427",
+                corner_radius=10,
+            )
+            item_frame.pack(fill="x", padx=4, pady=6)
+
+            item_button = ctk.CTkButton(
+                item_frame,
+                text=project[2],
+                fg_color="transparent",
+                hover_color="#315b82" if is_active else "#2d2f35",
+                anchor="w",
+                command=lambda project_item=project: self.select_project(project_item),
+            )
+            item_button.pack(fill="x", padx=8, pady=(8, 2))
+
+            path_label = ctk.CTkLabel(
+                item_frame,
+                text=project[3],
+                text_color="#b9c2cc",
+                anchor="w",
+                justify="left",
+                wraplength=220,
+            )
+            path_label.pack(fill="x", padx=14, pady=(0, 10))
+
+        active_path = self.current_project[3] if self.current_project else ""
+        self.project_status_label.configure(text=active_path, text_color="#8f8f8f")
+
+    def add_project_folder_from_dialog(self):
+        import tkinter.filedialog
+
+        user = self.ensure_current_user()
+        if not user:
+            self.project_status_label.configure(text="請先建立使用者", text_color="orange")
+            return
+
+        folder_path = tkinter.filedialog.askdirectory()
+        if not folder_path:
+            return
+
+        try:
+            project_id = add_project_folder(user[0], folder_path)
+            projects = get_projects(user[0])
+            self.current_project = next((project for project in projects if project[0] == project_id), None)
+            self.project_status_label.configure(text=f"已新增: {folder_path}", text_color="lightgreen")
+        except sqlite3.IntegrityError:
+            self.project_status_label.configure(text="此專案資料夾已存在", text_color="orange")
+        self.refresh_project_sidebar()
 
     def get_provider_defaults(self, provider_type):
         defaults = {
@@ -631,11 +827,427 @@ class AIPlatformApp(ctk.CTk):
     def set_status(self, widget, text, color="white"):
         widget.configure(text=text, text_color=color)
 
+    def configure_chat_display(self):
+        self.chat_bubble_max_width = 620
+        self.chat_text_wrap = self.chat_bubble_max_width - 100
+        self.input_min_height = 44
+        self.input_max_height = 156
+        self.input_wrap_chars = 52
+
+    def clear_chat_display(self):
+        for widget in self.chat_display.winfo_children():
+            widget.destroy()
+
+    def clear_conversation_history_widgets(self):
+        if hasattr(self, "conversation_history_frame"):
+            for widget in self.conversation_history_frame.winfo_children():
+                widget.destroy()
+
+    def toggle_history_panel(self):
+        self.history_expanded = not self.history_expanded
+        self.apply_history_panel_state()
+
+    def toggle_history_manage_mode(self):
+        self.history_manage_mode = not self.history_manage_mode
+        if not self.history_manage_mode and hasattr(self, "conversation_check_vars"):
+            for value in self.conversation_check_vars.values():
+                value.set(False)
+        self.apply_history_panel_state()
+        if self.current_user:
+            self.refresh_conversation_history_list(get_conversations(self.current_user[0]))
+
+    def apply_history_panel_state(self):
+        if hasattr(self, "history_toggle_button"):
+            self.history_toggle_button.configure(
+                text="歷史對話" if not self.history_expanded else "收合歷史"
+            )
+
+        if hasattr(self, "history_manage_button"):
+            self.history_manage_button.configure(
+                text="管理" if not self.history_manage_mode else "完成管理"
+            )
+            self.history_manage_button.configure(state="normal" if self.history_expanded else "disabled")
+
+        if hasattr(self, "btn_delete_conversations"):
+            if self.history_expanded and self.history_manage_mode:
+                if not self.btn_delete_conversations.winfo_manager():
+                    self.btn_delete_conversations.pack(side="right", padx=(8, 0))
+            else:
+                if self.btn_delete_conversations.winfo_manager():
+                    self.btn_delete_conversations.pack_forget()
+
+        if hasattr(self, "history_body_frame"):
+            if self.history_expanded:
+                if not self.history_body_frame.winfo_manager():
+                    self.history_body_frame.pack(fill="x", padx=8, pady=(0, 8))
+            else:
+                if self.history_body_frame.winfo_manager():
+                    self.history_body_frame.pack_forget()
+
+        self.update_batch_delete_button_state()
+
+    def update_batch_delete_button_state(self):
+        if not hasattr(self, "btn_delete_conversations"):
+            return
+
+        selected_count = 0
+        if hasattr(self, "conversation_check_vars"):
+            selected_count = sum(1 for value in self.conversation_check_vars.values() if value.get())
+
+        if self.history_manage_mode and selected_count > 0:
+            self.btn_delete_conversations.configure(
+                state="normal",
+                text=f"刪除勾選對話 ({selected_count})",
+            )
+        else:
+            self.btn_delete_conversations.configure(
+                state="disabled",
+                text="刪除勾選對話",
+            )
+
+    def update_current_conversation_summary(self):
+        if not hasattr(self, "current_conversation_label"):
+            return
+
+        if self.current_conversation:
+            title = self.current_conversation[2]
+            created_at = self.current_conversation[3][:16].replace("T", " ")
+            self.current_conversation_label.configure(
+                text=f"目前對話: {title}  |  {created_at}",
+                text_color="#d8e4f2",
+            )
+        else:
+            self.current_conversation_label.configure(
+                text="目前對話: 新對話",
+                text_color="#b8b8b8",
+            )
+
+    def open_conversation_by_id(self, conversation_id):
+        if not self.current_user:
+            return
+
+        conversations = get_conversations(self.current_user[0])
+        target = next((conversation for conversation in conversations if conversation[0] == conversation_id), None)
+        if not target:
+            return
+
+        self.current_conversation = target
+        self.update_current_conversation_summary()
+        self.load_messages()
+
+    def refresh_conversation_history_list(self, conversations):
+        self.clear_conversation_history_widgets()
+        self.conversation_check_vars = {}
+        if hasattr(self, "history_summary_label"):
+            self.history_summary_label.configure(text=f"歷史對話 ({len(conversations)})")
+
+        if not conversations:
+            empty_label = ctk.CTkLabel(
+                self.conversation_history_frame,
+                text="尚無歷史對話",
+                text_color="#9f9f9f",
+            )
+            empty_label.pack(anchor="w", padx=8, pady=8)
+            self.update_batch_delete_button_state()
+            return
+
+        for conversation in conversations:
+            conversation_id = conversation[0]
+            check_var = ctk.BooleanVar(value=False)
+            self.conversation_check_vars[conversation_id] = check_var
+
+            is_active = self.current_conversation and self.current_conversation[0] == conversation_id
+            item_frame = ctk.CTkFrame(
+                self.conversation_history_frame,
+                fg_color="#244e73" if is_active else "#232427",
+                corner_radius=10,
+            )
+            item_frame.pack(fill="x", padx=4, pady=4)
+
+            top_row = ctk.CTkFrame(item_frame, fg_color="transparent")
+            top_row.pack(fill="x", padx=8, pady=(6, 6))
+
+            if self.history_manage_mode:
+                checkbox = ctk.CTkCheckBox(
+                    top_row,
+                    text="",
+                    width=24,
+                    variable=check_var,
+                    command=self.update_batch_delete_button_state,
+                )
+                checkbox.pack(side="left", padx=(0, 6))
+
+            open_button = ctk.CTkButton(
+                top_row,
+                text=conversation[2],
+                fg_color="transparent",
+                hover_color="#315b82" if is_active else "#2d2f35",
+                anchor="w",
+                command=lambda conversation_item_id=conversation_id: self.open_conversation_by_id(conversation_item_id),
+            )
+            open_button.pack(side="left", fill="x", expand=True)
+
+            timestamp_label = ctk.CTkLabel(
+                top_row,
+                text=conversation[3][:16].replace("T", " "),
+                text_color="#9ea7b3",
+                font=ctk.CTkFont(size=11),
+            )
+            timestamp_label.pack(side="right", padx=(8, 2))
+
+        self.update_batch_delete_button_state()
+
+    def batch_delete_selected_conversations(self):
+        if not self.current_user or not hasattr(self, "conversation_check_vars"):
+            return
+
+        selected_ids = [
+            conversation_id
+            for conversation_id, variable in self.conversation_check_vars.items()
+            if variable.get()
+        ]
+        if not selected_ids:
+            return
+
+        current_conversation_id = self.current_conversation[0] if self.current_conversation else None
+
+        for conversation_id in selected_ids:
+            delete_conversation(conversation_id)
+
+        if current_conversation_id in selected_ids:
+            self.current_conversation = None
+
+        self.load_conversations()
+
+    def get_input_text(self):
+        return self.msg_entry.get("1.0", "end-1c").strip()
+
+    def clear_input_text(self):
+        self.msg_entry.delete("1.0", "end")
+        self.autosize_input_box()
+
+    def estimate_input_line_count(self, text):
+        raw_lines = text.splitlines() or [""]
+        total_lines = 0
+
+        for raw_line in raw_lines:
+            visual_lines = max(1, (len(raw_line) // self.input_wrap_chars) + 1)
+            total_lines += visual_lines
+
+        return total_lines
+
+    def autosize_input_box(self, event=None):
+        text = self.msg_entry.get("1.0", "end-1c")
+        visual_lines = min(6, max(1, self.estimate_input_line_count(text)))
+        target_height = self.input_min_height + (visual_lines - 1) * 22
+        target_height = max(self.input_min_height, min(self.input_max_height, target_height))
+        self.msg_entry.configure(height=target_height)
+
+    def on_input_return(self, event):
+        if event.state & 0x0001:
+            return None
+
+        self.send_message()
+        return "break"
+
+    def format_display_value(self, value):
+        if value is None:
+            return ""
+
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                    return json.dumps(parsed, ensure_ascii=False, indent=2)
+                except Exception:
+                    return value
+            return value
+
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, ensure_ascii=False, indent=2)
+
+        return str(value)
+
+    def normalize_chat_item(self, item, default_role="assistant", default_kind="message"):
+        if isinstance(item, str):
+            return {
+                "role": default_role,
+                "kind": default_kind,
+                "title": "",
+                "content": item,
+                "meta": {},
+                "sections": [],
+                "timestamp": "",
+            }
+
+        if not isinstance(item, dict):
+            return {
+                "role": default_role,
+                "kind": default_kind,
+                "title": "",
+                "content": str(item),
+                "meta": {},
+                "sections": [],
+                "timestamp": "",
+            }
+
+        return {
+            "role": item.get("role", default_role),
+            "kind": item.get("kind", default_kind),
+            "title": item.get("title", ""),
+            "content": item.get("content", item.get("text", item.get("message", ""))),
+            "meta": item.get("meta", {}),
+            "sections": item.get("sections", []),
+            "timestamp": item.get("timestamp", ""),
+        }
+
+    def render_chat_item(self, item):
+        normalized = self.normalize_chat_item(item)
+
+        role_labels = {
+            "user": "USER",
+            "assistant": "AI",
+            "system": "SYSTEM",
+            "tool": "TOOL",
+        }
+        kind_labels = {
+            "message": "",
+            "status": "STATUS",
+            "warning": "WARNING",
+            "error": "ERROR",
+            "result": "RESULT",
+            "tool_call": "TOOL CALL",
+            "tool_result": "TOOL RESULT",
+        }
+
+        header_parts = [role_labels.get(normalized["role"], str(normalized["role"]).upper())]
+        kind_label = kind_labels.get(normalized["kind"], str(normalized["kind"]).replace("_", " ").upper())
+
+        if kind_label:
+            header_parts.append(kind_label)
+        if normalized["title"]:
+            header_parts.append(str(normalized["title"]))
+        if normalized["timestamp"]:
+            header_parts.append(str(normalized["timestamp"]))
+
+        role = normalized["role"]
+        kind = normalized["kind"]
+        side = "right" if role == "user" else "left"
+
+        bubble_styles = {
+            "user": {"fg_color": "#1f6aa5", "text_color": "#ffffff", "header_color": "#d9ecff"},
+            "assistant": {"fg_color": "#2b2b2b", "text_color": "#f2f2f2", "header_color": "#9fd3a8"},
+            "system": {"fg_color": "#3a2f1e", "text_color": "#fff4d6", "header_color": "#f8d27a"},
+            "tool": {"fg_color": "#2a2438", "text_color": "#efe7ff", "header_color": "#c8b8ff"},
+        }
+        kind_overrides = {
+            "error": {"fg_color": "#4a1f1f", "text_color": "#ffd6d6", "header_color": "#ff9d9d"},
+            "warning": {"fg_color": "#4a3b12", "text_color": "#fff0c7", "header_color": "#ffd36f"},
+            "status": {"fg_color": "#1f2f45", "text_color": "#dbeafe", "header_color": "#93c5fd"},
+            "result": {"fg_color": "#203529", "text_color": "#dbffe7", "header_color": "#8de1aa"},
+        }
+
+        style = dict(bubble_styles.get(role, bubble_styles["assistant"]))
+        style.update(kind_overrides.get(kind, {}))
+
+        row_frame = ctk.CTkFrame(self.chat_display, fg_color="transparent")
+        row_frame.pack(fill="x", padx=10, pady=6)
+
+        bubble_frame = ctk.CTkFrame(
+            row_frame,
+            fg_color=style["fg_color"],
+            corner_radius=14,
+        )
+        bubble_frame.pack(side=side, anchor="e" if side == "right" else "w", padx=10)
+
+        header_label = ctk.CTkLabel(
+            bubble_frame,
+            text=" | ".join(header_parts),
+            text_color=style["header_color"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+            justify="left",
+        )
+        header_label.pack(fill="x", padx=14, pady=(10, 2))
+
+        meta = normalized["meta"] or {}
+        if isinstance(meta, dict) and meta:
+            meta_line = " | ".join(f"{key}: {self.format_display_value(value)}" for key, value in meta.items())
+            if meta_line:
+                meta_label = ctk.CTkLabel(
+                    bubble_frame,
+                    text=meta_line,
+                    text_color="#c7c7c7",
+                    font=ctk.CTkFont(size=11),
+                    anchor="w",
+                    justify="left",
+                    wraplength=self.chat_text_wrap,
+                )
+                meta_label.pack(fill="x", padx=14, pady=(0, 4))
+
+        content = self.format_display_value(normalized["content"])
+        if content:
+            content_label = ctk.CTkLabel(
+                bubble_frame,
+                text=content,
+                text_color=style["text_color"],
+                font=ctk.CTkFont(size=14),
+                anchor="w",
+                justify="left",
+                wraplength=self.chat_text_wrap,
+            )
+            content_label.pack(fill="x", padx=14, pady=(0, 8))
+
+        for section in normalized["sections"] or []:
+            if not isinstance(section, dict):
+                section_label = ctk.CTkLabel(
+                    bubble_frame,
+                    text=self.format_display_value(section),
+                    text_color=style["text_color"],
+                    font=ctk.CTkFont(size=13),
+                    anchor="w",
+                    justify="left",
+                    wraplength=self.chat_text_wrap,
+                )
+                section_label.pack(fill="x", padx=14, pady=(0, 6))
+                continue
+
+            section_title = section.get("title", "")
+            section_content = self.format_display_value(section.get("content", ""))
+
+            if section_title:
+                section_title_label = ctk.CTkLabel(
+                    bubble_frame,
+                    text=f"[{section_title}]",
+                    text_color=style["header_color"],
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    anchor="w",
+                    justify="left",
+                )
+                section_title_label.pack(fill="x", padx=14, pady=(2, 2))
+            if section_content:
+                section_content_label = ctk.CTkLabel(
+                    bubble_frame,
+                    text=section_content,
+                    text_color=style["text_color"],
+                    font=ctk.CTkFont(size=13),
+                    anchor="w",
+                    justify="left",
+                    wraplength=self.chat_text_wrap,
+                )
+                section_content_label.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.update_idletasks()
+        if hasattr(self.chat_display, "_parent_canvas"):
+            self.chat_display._parent_canvas.yview_moveto(1.0)
+
     def get_chat_provider_names(self):
         return [provider[1] for provider in get_providers()]
 
     def show_chat(self):
         self.clear_main()
+        self.set_active_nav("chat")
 
         title = ctk.CTkLabel(
             self.main_frame,
@@ -644,53 +1256,117 @@ class AIPlatformApp(ctk.CTk):
         )
         title.pack(pady=10)
 
-        top_frame = ctk.CTkFrame(self.main_frame)
-        top_frame.pack(padx=20, pady=10, fill="x")
+        toolbar_frame = ctk.CTkFrame(self.main_frame)
+        toolbar_frame.pack(padx=20, pady=10, fill="x")
 
-        ctk.CTkLabel(top_frame, text="使用者:").pack(side="left", padx=5)
+        ctk.CTkLabel(toolbar_frame, text="使用者").pack(side="left", padx=(10, 6))
         self.user_var = ctk.StringVar()
-        self.user_combo = ctk.CTkComboBox(top_frame, values=[], variable=self.user_var, command=self.on_user_changed)
-        self.user_combo.pack(side="left", padx=5, fill="x", expand=True)
+        self.user_combo = ctk.CTkComboBox(toolbar_frame, values=[], variable=self.user_var, command=self.on_user_changed, width=220)
+        self.user_combo.pack(side="left", padx=(0, 12))
 
-        self.btn_new_chat = ctk.CTkButton(top_frame, text="新對話", command=self.new_conversation)
-        self.btn_new_chat.pack(side="left", padx=5)
-
-        provider_frame = ctk.CTkFrame(self.main_frame)
-        provider_frame.pack(padx=20, pady=5, fill="x")
-
-        ctk.CTkLabel(provider_frame, text="對話供應商:").pack(side="left", padx=5)
+        ctk.CTkLabel(toolbar_frame, text="供應商").pack(side="left", padx=(0, 6))
         self.chat_provider_var = ctk.StringVar()
         self.chat_provider_combo = ctk.CTkComboBox(
-            provider_frame,
+            toolbar_frame,
             values=[],
             variable=self.chat_provider_var,
             command=self.on_chat_provider_changed,
+            width=240,
         )
-        self.chat_provider_combo.pack(side="left", padx=5, fill="x", expand=True)
+        self.chat_provider_combo.pack(side="left", padx=(0, 12))
 
-        self.chat_provider_status = ctk.CTkLabel(provider_frame, text="")
-        self.chat_provider_status.pack(side="left", padx=8)
+        self.chat_provider_status = ctk.CTkLabel(toolbar_frame, text="")
+        self.chat_provider_status.pack(side="left", padx=(0, 12))
 
-        conv_frame = ctk.CTkFrame(self.main_frame)
-        conv_frame.pack(padx=20, pady=5, fill="x")
+        self.btn_new_chat = ctk.CTkButton(toolbar_frame, text="新對話", width=110, command=self.new_conversation)
+        self.btn_new_chat.pack(side="right", padx=(8, 10))
 
-        ctk.CTkLabel(conv_frame, text="對話:").pack(side="left", padx=5)
-        self.conv_var = ctk.StringVar()
-        self.conv_combo = ctk.CTkComboBox(conv_frame, values=[], variable=self.conv_var, command=self.on_conv_changed)
-        self.conv_combo.pack(side="left", padx=5, fill="x", expand=True)
+        summary_frame = ctk.CTkFrame(self.main_frame)
+        summary_frame.pack(padx=20, pady=(0, 8), fill="x")
 
-        self.chat_display = ctk.CTkTextbox(self.main_frame, wrap="word")
+        self.current_conversation_label = ctk.CTkLabel(
+            summary_frame,
+            text="目前對話: 新對話",
+            anchor="w",
+            text_color="#d8e4f2",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.current_conversation_label.pack(side="left", padx=12, pady=8)
+
+        history_frame = ctk.CTkFrame(self.main_frame)
+        history_frame.pack(padx=20, pady=(0, 8), fill="x")
+
+        history_header = ctk.CTkFrame(history_frame, fg_color="transparent")
+        history_header.pack(fill="x", padx=8, pady=(6, 6))
+
+        self.history_summary_label = ctk.CTkLabel(
+            history_header,
+            text="歷史對話",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.history_summary_label.pack(side="left")
+
+        self.history_toggle_button = ctk.CTkButton(
+            history_header,
+            text="展開歷史對話",
+            width=120,
+            command=self.toggle_history_panel,
+        )
+        self.history_toggle_button.pack(side="right", padx=(8, 0))
+
+        self.history_manage_button = ctk.CTkButton(
+            history_header,
+            text="管理",
+            width=90,
+            fg_color="#4b5563",
+            hover_color="#374151",
+            command=self.toggle_history_manage_mode,
+        )
+        self.history_manage_button.pack(side="right", padx=(8, 0))
+
+        self.btn_delete_conversations = ctk.CTkButton(
+            history_header,
+            text="刪除勾選對話",
+            width=140,
+            state="disabled",
+            fg_color="#9b2c2c",
+            hover_color="#7f1d1d",
+            command=self.batch_delete_selected_conversations,
+        )
+
+        self.history_body_frame = ctk.CTkFrame(history_frame, fg_color="transparent")
+
+        self.conversation_history_frame = ctk.CTkScrollableFrame(self.history_body_frame, height=120, corner_radius=10)
+        self.conversation_history_frame.pack(fill="x")
+        self.conversation_check_vars = {}
+        self.apply_history_panel_state()
+
+        self.chat_display = ctk.CTkScrollableFrame(self.main_frame, corner_radius=10)
         self.chat_display.pack(padx=20, pady=10, fill="both", expand=True)
+        self.configure_chat_display()
 
         input_frame = ctk.CTkFrame(self.main_frame)
         input_frame.pack(padx=20, pady=10, fill="x")
 
-        self.msg_entry = ctk.CTkEntry(input_frame, placeholder_text="輸入訊息...")
-        self.msg_entry.pack(side="left", fill="x", expand=True, padx=5)
-        self.msg_entry.bind("<Return>", self.send_message)
+        input_hint = ctk.CTkLabel(
+            input_frame,
+            text="輸入訊息，Enter 送出，Shift+Enter 換行",
+            text_color="#b8b8b8",
+            anchor="w",
+        )
+        input_hint.pack(fill="x", padx=10, pady=(8, 4))
 
-        self.btn_send = ctk.CTkButton(input_frame, text="傳送", command=self.send_message)
-        self.btn_send.pack(side="left", padx=5)
+        input_row = ctk.CTkFrame(input_frame, fg_color="transparent")
+        input_row.pack(fill="x", padx=8, pady=(0, 8))
+
+        self.msg_entry = ctk.CTkTextbox(input_row, height=self.input_min_height, corner_radius=10)
+        self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.msg_entry.bind("<KeyRelease>", self.autosize_input_box)
+        self.msg_entry.bind("<Return>", self.on_input_return)
+
+        self.btn_send = ctk.CTkButton(input_row, text="傳送", width=96, command=self.send_message)
+        self.btn_send.pack(side="right")
+        self.autosize_input_box()
 
         self.load_chat_providers()
         self.load_users_for_chat()
@@ -719,53 +1395,54 @@ class AIPlatformApp(ctk.CTk):
         user_names = [user[1] for user in users]
         self.user_combo.configure(values=user_names if user_names else [""])
         if user_names:
-            self.user_combo.set(user_names[0])
+            selected_name = self.current_user[1] if self.current_user and self.current_user[1] in user_names else user_names[0]
+            self.user_combo.set(selected_name)
             self.on_user_changed()
         else:
             self.user_combo.set("")
             self.current_user = None
+            self.refresh_project_sidebar()
 
     def on_user_changed(self, event=None):
         users = get_users()
         user_map = {user[1]: user for user in users}
         selected_name = self.user_var.get()
         self.current_user = user_map.get(selected_name)
+        self.current_project = None
+        self.refresh_project_sidebar()
         self.load_conversations()
 
-    def load_conversations(self):
+    def load_conversations(self, selected_title=None):
         if not self.current_user:
-            self.conv_combo.configure(values=[""])
-            self.conv_combo.set("")
             self.current_conversation = None
+            self.refresh_conversation_history_list([])
+            self.apply_history_panel_state()
+            self.update_current_conversation_summary()
             if hasattr(self, "chat_display"):
-                self.chat_display.delete("1.0", "end")
+                self.clear_chat_display()
             return
 
         conversations = get_conversations(self.current_user[0])
         conversation_titles = [conversation[2] for conversation in conversations]
-        values = ["新對話"] + conversation_titles
-        self.conv_combo.configure(values=values)
-        self.conv_combo.set("新對話")
-        self.current_conversation = None
-        self.load_messages()
 
-    def on_conv_changed(self, event=None):
-        selected = self.conv_var.get()
-        if selected == "新對話":
+        if selected_title and selected_title in conversation_titles:
+            self.current_conversation = next(
+                (conversation for conversation in conversations if conversation[2] == selected_title),
+                None,
+            )
+        elif conversation_titles:
+            self.current_conversation = conversations[0]
+        else:
             self.current_conversation = None
-            self.chat_display.delete("1.0", "end")
-            return
 
-        conversations = get_conversations(self.current_user[0]) if self.current_user else []
-        for conversation in conversations:
-            if conversation[2] == selected:
-                self.current_conversation = conversation
-                break
+        self.refresh_conversation_history_list(conversations)
+        self.apply_history_panel_state()
+        self.update_current_conversation_summary()
         self.load_messages()
 
     def new_conversation(self):
         if not self.current_user:
-            return
+            return None
 
         title = f"對話 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         conversation_id = create_conversation(self.current_user[0], title)
@@ -775,62 +1452,102 @@ class AIPlatformApp(ctk.CTk):
             title,
             datetime.now().isoformat(),
         )
-        self.load_conversations()
-        self.conv_combo.set(title)
-        self.chat_display.delete("1.0", "end")
+        self.load_conversations(selected_title=title)
+        self.clear_chat_display()
+        return self.current_conversation
 
     def load_messages(self):
-        self.chat_display.delete("1.0", "end")
+        self.clear_chat_display()
         if not self.current_conversation:
             return
 
         messages = get_messages(self.current_conversation[0])
         for message in messages:
-            role = "User" if message[2] == "user" else "AI"
-            self.chat_display.insert("end", f"【{role}】\n{message[3]}\n\n")
+            self.render_chat_item(
+                {
+                    "role": message[2],
+                    "content": message[3],
+                    "timestamp": message[4],
+                }
+            )
 
     def send_message(self, event=None):
         if not self.current_user:
-            self.chat_display.insert("end", "⚠️ 請先建立使用者\n\n")
+            self.render_chat_item({"role": "system", "kind": "warning", "content": "請先建立使用者"})
             return
 
         provider = get_active_provider()
         if not provider:
-            self.chat_display.insert("end", "⚠️ 請先到「系統設定」新增並驗證 API 供應商\n\n")
+            self.render_chat_item(
+                {
+                    "role": "system",
+                    "kind": "warning",
+                    "content": "請先到「系統設定」新增並驗證 API 供應商",
+                }
+            )
             return
 
-        message_text = self.msg_entry.get().strip()
+        message_text = self.get_input_text()
         if not message_text:
             return
 
         if not self.current_conversation:
             self.new_conversation()
 
-        self.chat_display.insert("end", f"【User】\n{message_text}\n\n")
-        self.msg_entry.delete(0, "end")
-        save_message(self.current_conversation[0], "user", message_text)
+        if not self.current_conversation:
+            self.render_chat_item({"role": "system", "kind": "error", "content": "無法建立新對話，請重試"})
+            return
 
-        message_rows = get_messages(self.current_conversation[0])
-        messages = [{"role": row[2], "content": row[3]} for row in message_rows]
+        self.render_chat_item({"role": "user", "content": message_text})
+        self.clear_input_text()
+        try:
+            save_message(self.current_conversation[0], "user", message_text)
 
-        self.chat_display.insert("end", f"【AI / {provider[1]} / {provider[5]}】處理中...\n")
-        self.chat_display.see("end")
-        self.update()
+            message_rows = get_messages(self.current_conversation[0])
+            messages = [{"role": row[2], "content": row[3]} for row in message_rows]
 
-        response = call_provider(
-            provider[2],
-            provider[4],
-            provider[3],
-            provider[5],
-            messages,
-        )
+            self.render_chat_item(
+                {
+                    "role": "assistant",
+                    "kind": "status",
+                    "title": "處理中",
+                    "content": "模型正在處理你的請求。",
+                    "meta": {"provider": provider[1], "model": provider[5]},
+                }
+            )
+            self.update()
 
-        self.chat_display.insert("end", f"{response}\n\n")
-        self.chat_display.see("end")
-        save_message(self.current_conversation[0], "assistant", response)
+            response = call_provider(
+                provider[2],
+                provider[4],
+                provider[3],
+                provider[5],
+                messages,
+            )
+
+            self.render_chat_item(
+                {
+                    "role": "assistant",
+                    "kind": "result",
+                    "content": response,
+                    "meta": {"provider": provider[1], "model": provider[5]},
+                }
+            )
+            save_message(self.current_conversation[0], "assistant", response)
+        except Exception as exc:
+            self.render_chat_item(
+                {
+                    "role": "system",
+                    "kind": "error",
+                    "title": "對話處理失敗",
+                    "content": str(exc),
+                    "meta": {"provider": provider[1], "model": provider[5]},
+                }
+            )
 
     def show_users(self):
         self.clear_main()
+        self.set_active_nav("users")
 
         title = ctk.CTkLabel(
             self.main_frame,
@@ -870,9 +1587,13 @@ class AIPlatformApp(ctk.CTk):
 
         try:
             add_user(username, email)
+            users = get_users()
+            self.current_user = next((user for user in users if user[1] == username), self.current_user)
+            self.current_project = None
             self.new_username.delete(0, "end")
             self.new_email.delete(0, "end")
             self.refresh_user_list()
+            self.refresh_project_sidebar()
         except sqlite3.IntegrityError:
             self.user_list.insert("end", "⚠️ 使用者已存在\n")
 
@@ -887,6 +1608,7 @@ class AIPlatformApp(ctk.CTk):
 
     def show_settings(self):
         self.clear_main()
+        self.set_active_nav("settings")
 
         title = ctk.CTkLabel(
             self.main_frame,
@@ -1122,6 +1844,7 @@ class AIPlatformApp(ctk.CTk):
 
     def show_knowledge(self):
         self.clear_main()
+        self.set_active_nav("knowledge")
 
         title = ctk.CTkLabel(
             self.main_frame,
@@ -1184,6 +1907,7 @@ class AIPlatformApp(ctk.CTk):
 
     def show_tools(self):
         self.clear_main()
+        self.set_active_nav("tools")
 
         title = ctk.CTkLabel(
             self.main_frame,
