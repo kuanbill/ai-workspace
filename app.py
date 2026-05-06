@@ -1,5 +1,9 @@
 import json
+import hashlib
+import math
 import os
+import re
+import shutil
 import sqlite3
 from datetime import datetime
 
@@ -11,11 +15,65 @@ ctk.set_default_color_theme("blue")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 KB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_base")
+KB_SOURCE_DIR = os.path.join(KB_DIR, "sources")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(KB_DIR, exist_ok=True)
+os.makedirs(KB_SOURCE_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "platform.db")
+LOCAL_VECTOR_PATH = os.path.join(KB_DIR, "local_vectors.jsonl")
 AZURE_OPENAI_API_VERSION = "2024-10-21"
+LOCAL_VECTOR_DIMENSIONS = 384
+
+UI_FONT_DEFAULTS = {
+    "app_title": 20,
+    "nav": 14,
+    "sidebar_title": 18,
+    "sidebar_body": 13,
+    "page_title": 18,
+    "control": 13,
+    "chat_body": 14,
+    "chat_meta": 11,
+    "input": 14,
+}
+
+UI_FONT_LABELS = {
+    "app_title": "頂部標題",
+    "nav": "上方導覽按鈕",
+    "sidebar_title": "左側專案標題",
+    "sidebar_body": "左側專案內容",
+    "page_title": "各頁主標題",
+    "control": "表單、按鈕與清單",
+    "chat_body": "AI 對話內容",
+    "chat_meta": "對話資訊與時間",
+    "input": "訊息輸入框",
+}
+
+CHAT_THEME_OPTIONS = ["黑灰白", "藍灰", "綠灰"]
+
+CHAT_THEME_STYLES = {
+    "黑灰白": {
+        "user": {"fg_color": "#111111", "text_color": "#ffffff", "header_color": "#dcdcdc"},
+        "assistant": {"fg_color": "#2b2b2b", "text_color": "#f3f3f3", "header_color": "#f0f0f0"},
+        "system": {"fg_color": "#3a3a3a", "text_color": "#f5f5f5", "header_color": "#ffffff"},
+        "tool": {"fg_color": "#242424", "text_color": "#eeeeee", "header_color": "#d0d0d0"},
+        "copy": {"fg_color": "#444444", "hover_color": "#5a5a5a", "text_color": "#ffffff"},
+    },
+    "藍灰": {
+        "user": {"fg_color": "#17202a", "text_color": "#f5f8fb", "header_color": "#dce6ef"},
+        "assistant": {"fg_color": "#26313b", "text_color": "#f1f4f7", "header_color": "#cfd9e2"},
+        "system": {"fg_color": "#323940", "text_color": "#f2f4f5", "header_color": "#e5eaee"},
+        "tool": {"fg_color": "#202830", "text_color": "#f0f4f7", "header_color": "#cdd7df"},
+        "copy": {"fg_color": "#3f5263", "hover_color": "#526879", "text_color": "#ffffff"},
+    },
+    "綠灰": {
+        "user": {"fg_color": "#16211d", "text_color": "#f4fbf7", "header_color": "#d8e8de"},
+        "assistant": {"fg_color": "#25312c", "text_color": "#f2f7f4", "header_color": "#d2ddd7"},
+        "system": {"fg_color": "#343b38", "text_color": "#f3f6f4", "header_color": "#e3ebe6"},
+        "tool": {"fg_color": "#1f2824", "text_color": "#eff6f2", "header_color": "#cad8d0"},
+        "copy": {"fg_color": "#3e574b", "hover_color": "#506b5e", "text_color": "#ffffff"},
+    },
+}
 
 
 def init_db():
@@ -60,6 +118,17 @@ def init_db():
             content TEXT,
             uploaded_at TEXT)"""
     )
+    c.execute("PRAGMA table_info(knowledge_docs)")
+    existing_knowledge_columns = {row[1] for row in c.fetchall()}
+    knowledge_columns = {
+        "source_path": "TEXT",
+        "chunk_count": "INTEGER DEFAULT 0",
+        "vector_status": "TEXT DEFAULT 'pending'",
+        "vectorized_at": "TEXT",
+    }
+    for column_name, column_type in knowledge_columns.items():
+        if column_name not in existing_knowledge_columns:
+            c.execute(f"ALTER TABLE knowledge_docs ADD COLUMN {column_name} {column_type}")
     c.execute(
         """CREATE TABLE IF NOT EXISTS settings
            (key TEXT PRIMARY KEY,
@@ -308,12 +377,29 @@ def get_knowledge_docs():
     return docs
 
 
-def save_knowledge_doc(filename, content):
+def save_knowledge_doc(filename, content, source_path=""):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO knowledge_docs (filename, content, uploaded_at) VALUES (?, ?, ?)",
-        (filename, content, datetime.now().isoformat()),
+        """INSERT INTO knowledge_docs
+           (filename, content, uploaded_at, source_path, chunk_count, vector_status)
+           VALUES (?, ?, ?, ?, 0, 'pending')""",
+        (filename, content, datetime.now().isoformat(), source_path),
+    )
+    doc_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return doc_id
+
+
+def update_knowledge_vector_status(doc_id, chunk_count, status):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """UPDATE knowledge_docs
+           SET chunk_count = ?, vector_status = ?, vectorized_at = ?
+           WHERE id = ?""",
+        (chunk_count, status, datetime.now().isoformat(), doc_id),
     )
     conn.commit()
     conn.close()
@@ -325,6 +411,157 @@ def delete_knowledge_doc(doc_id):
     c.execute("DELETE FROM knowledge_docs WHERE id = ?", (doc_id,))
     conn.commit()
     conn.close()
+
+
+def read_text_file(file_path):
+    for encoding in ("utf-8-sig", "utf-8", "cp950", "big5"):
+        try:
+            with open(file_path, "r", encoding=encoding) as file_handle:
+                return file_handle.read()
+        except UnicodeDecodeError:
+            continue
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as file_handle:
+        return file_handle.read()
+
+
+def split_text_chunks(text, max_chars=900, overlap=150):
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+    chunks = []
+    current = ""
+
+    for paragraph in paragraphs:
+        if len(paragraph) > max_chars:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            start = 0
+            while start < len(paragraph):
+                chunk = paragraph[start : start + max_chars].strip()
+                if chunk:
+                    chunks.append(chunk)
+                start += max_chars - overlap
+            continue
+
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = paragraph
+
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+def tokenize_for_vector(text):
+    lowered = text.lower()
+    tokens = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]", lowered)
+    return tokens
+
+
+def embed_text_sparse(text):
+    vector = {}
+    for token in tokenize_for_vector(text):
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:4], "big") % LOCAL_VECTOR_DIMENSIONS
+        sign = 1 if digest[4] % 2 == 0 else -1
+        vector[index] = vector.get(index, 0.0) + sign
+
+    norm = math.sqrt(sum(value * value for value in vector.values()))
+    if not norm:
+        return {}
+    return {str(index): round(value / norm, 6) for index, value in vector.items() if value}
+
+
+def sparse_cosine_similarity(left, right):
+    if not left or not right:
+        return 0.0
+    if len(left) > len(right):
+        left, right = right, left
+    return sum(value * right.get(index, 0.0) for index, value in left.items())
+
+
+def append_local_vectors(doc_id, filename, chunks):
+    if not chunks:
+        return 0
+
+    with open(LOCAL_VECTOR_PATH, "a", encoding="utf-8") as file_handle:
+        for index, chunk in enumerate(chunks):
+            record = {
+                "doc_id": doc_id,
+                "filename": filename,
+                "chunk_index": index,
+                "text": chunk,
+                "embedding": embed_text_sparse(chunk),
+                "created_at": datetime.now().isoformat(),
+            }
+            file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return len(chunks)
+
+
+def vectorize_knowledge_doc(doc_id, filename, content):
+    chunks = split_text_chunks(content)
+    chunk_count = append_local_vectors(doc_id, filename, chunks)
+    update_knowledge_vector_status(doc_id, chunk_count, "ready" if chunk_count else "empty")
+    return chunk_count
+
+
+def search_local_knowledge(query, limit=5):
+    if not os.path.exists(LOCAL_VECTOR_PATH):
+        return []
+
+    query_vector = {int(index): value for index, value in embed_text_sparse(query).items()}
+    if not query_vector:
+        return []
+
+    matches = []
+    with open(LOCAL_VECTOR_PATH, "r", encoding="utf-8") as file_handle:
+        for line in file_handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            vector = {int(index): value for index, value in record.get("embedding", {}).items()}
+            score = sparse_cosine_similarity(query_vector, vector)
+            if score > 0:
+                matches.append((score, record))
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "score": score,
+            "filename": record.get("filename", ""),
+            "text": record.get("text", ""),
+            "chunk_index": record.get("chunk_index", 0),
+        }
+        for score, record in matches[:limit]
+    ]
+
+
+def build_knowledge_context(query, limit=5):
+    matches = search_local_knowledge(query, limit=limit)
+    if not matches:
+        return "", []
+
+    sections = []
+    for index, match in enumerate(matches, start=1):
+        sections.append(
+            f"[知識片段 {index}] 來源: {match['filename']} / chunk {match['chunk_index']} / score {match['score']:.3f}\n"
+            f"{match['text']}"
+        )
+    return "\n\n".join(sections), matches
+
+
+def get_local_vector_stats():
+    if not os.path.exists(LOCAL_VECTOR_PATH):
+        return 0
+    count = 0
+    with open(LOCAL_VECTOR_PATH, "r", encoding="utf-8") as file_handle:
+        for _line in file_handle:
+            count += 1
+    return count
 
 
 def normalize_base_url(base_url):
@@ -626,8 +863,77 @@ class AIPlatformApp(ctk.CTk):
         self.selected_file = None
         self.history_expanded = False
         self.history_manage_mode = False
+        self.current_view = "chat"
+        self.font_size_vars = {}
+        self.load_ui_font_sizes()
+        self.load_chat_display_settings()
 
         self.setup_ui()
+
+    def load_ui_font_sizes(self):
+        self.ui_font_sizes = {}
+        for key, default_size in UI_FONT_DEFAULTS.items():
+            raw_value = get_setting(f"ui_font_{key}", str(default_size))
+            try:
+                size = int(raw_value)
+            except (TypeError, ValueError):
+                size = default_size
+            self.ui_font_sizes[key] = max(9, min(32, size))
+
+    def ui_font(self, key, weight=None):
+        size = self.ui_font_sizes.get(key, UI_FONT_DEFAULTS.get(key, 13))
+        return ctk.CTkFont(size=size, weight=weight)
+
+    def load_chat_display_settings(self):
+        raw_width = get_setting("chat_bubble_width", "860")
+        try:
+            width = int(raw_width)
+        except (TypeError, ValueError):
+            width = 860
+        self.chat_bubble_setting_width = max(520, min(1100, width))
+
+        theme = get_setting("chat_color_theme", "黑灰白")
+        self.chat_color_theme = theme if theme in CHAT_THEME_STYLES else "黑灰白"
+
+    def get_chat_theme_styles(self):
+        return CHAT_THEME_STYLES.get(self.chat_color_theme, CHAT_THEME_STYLES["黑灰白"])
+
+    def apply_ui_fonts(self):
+        if hasattr(self, "topbar_title"):
+            self.topbar_title.configure(font=self.ui_font("app_title", "bold"))
+        if hasattr(self, "project_title"):
+            self.project_title.configure(font=self.ui_font("sidebar_title", "bold"))
+        if hasattr(self, "project_user_label"):
+            self.project_user_label.configure(font=self.ui_font("sidebar_body"))
+        if hasattr(self, "project_status_label"):
+            self.project_status_label.configure(font=self.ui_font("sidebar_body"))
+        if hasattr(self, "btn_add_project"):
+            self.btn_add_project.configure(font=self.ui_font("control"))
+
+        if hasattr(self, "nav_frame"):
+            for widget in self.nav_frame.winfo_children():
+                if isinstance(widget, ctk.CTkButton):
+                    widget.configure(font=self.ui_font("nav"))
+
+    def apply_font_to_tree(self, parent):
+        for widget in parent.winfo_children():
+            try:
+                if isinstance(widget, ctk.CTkButton):
+                    widget.configure(font=self.ui_font("control"))
+                elif isinstance(widget, ctk.CTkLabel):
+                    widget.configure(font=self.ui_font("control"))
+                elif isinstance(widget, ctk.CTkEntry):
+                    widget.configure(font=self.ui_font("control"))
+                elif isinstance(widget, ctk.CTkComboBox):
+                    widget.configure(font=self.ui_font("control"))
+                elif isinstance(widget, ctk.CTkCheckBox):
+                    widget.configure(font=self.ui_font("control"))
+                elif isinstance(widget, ctk.CTkTextbox):
+                    role = "input" if widget == getattr(self, "msg_entry", None) else "control"
+                    widget.configure(font=self.ui_font(role))
+            except Exception:
+                pass
+            self.apply_font_to_tree(widget)
 
     def setup_ui(self):
         self.grid_columnconfigure(0, weight=0)
@@ -642,26 +948,26 @@ class AIPlatformApp(ctk.CTk):
         self.topbar_title = ctk.CTkLabel(
             self.topbar,
             text="AI 協作平台",
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=self.ui_font("app_title", "bold"),
         )
         self.topbar_title.grid(row=0, column=0, padx=(18, 12), pady=14, sticky="w")
 
         self.nav_frame = ctk.CTkFrame(self.topbar, fg_color="transparent")
         self.nav_frame.grid(row=0, column=1, padx=10, pady=12, sticky="w")
 
-        self.btn_chat = ctk.CTkButton(self.nav_frame, text="AI 對話", width=110, command=self.show_chat)
+        self.btn_chat = ctk.CTkButton(self.nav_frame, text="AI 對話", width=110, font=self.ui_font("nav"), command=self.show_chat)
         self.btn_chat.pack(side="left", padx=6)
 
-        self.btn_users = ctk.CTkButton(self.nav_frame, text="使用者資料", width=110, command=self.show_users)
+        self.btn_users = ctk.CTkButton(self.nav_frame, text="使用者資料", width=110, font=self.ui_font("nav"), command=self.show_users)
         self.btn_users.pack(side="left", padx=6)
 
-        self.btn_settings = ctk.CTkButton(self.nav_frame, text="系統設定", width=110, command=self.show_settings)
+        self.btn_settings = ctk.CTkButton(self.nav_frame, text="系統環境設定", width=140, font=self.ui_font("nav"), command=self.show_settings)
         self.btn_settings.pack(side="left", padx=6)
 
-        self.btn_knowledge = ctk.CTkButton(self.nav_frame, text="知識庫", width=110, command=self.show_knowledge)
+        self.btn_knowledge = ctk.CTkButton(self.nav_frame, text="知識庫", width=110, font=self.ui_font("nav"), command=self.show_knowledge)
         self.btn_knowledge.pack(side="left", padx=6)
 
-        self.btn_tools = ctk.CTkButton(self.nav_frame, text="AI Tools", width=110, command=self.show_tools)
+        self.btn_tools = ctk.CTkButton(self.nav_frame, text="AI Tools", width=110, font=self.ui_font("nav"), command=self.show_tools)
         self.btn_tools.pack(side="left", padx=6)
 
         self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color="#171718")
@@ -672,16 +978,22 @@ class AIPlatformApp(ctk.CTk):
         self.project_title = ctk.CTkLabel(
             self.sidebar,
             text="使用者專案",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self.ui_font("sidebar_title", "bold"),
         )
         self.project_title.grid(row=0, column=0, padx=16, pady=(18, 8), sticky="w")
 
-        self.project_user_label = ctk.CTkLabel(self.sidebar, text="目前使用者: 未選擇", text_color="#b8b8b8")
+        self.project_user_label = ctk.CTkLabel(
+            self.sidebar,
+            text="目前使用者: 未選擇",
+            text_color="#b8b8b8",
+            font=self.ui_font("sidebar_body"),
+        )
         self.project_user_label.grid(row=1, column=0, padx=16, pady=(0, 8), sticky="w")
 
         self.btn_add_project = ctk.CTkButton(
             self.sidebar,
             text="新增專案資料夾",
+            font=self.ui_font("control"),
             command=self.add_project_folder_from_dialog,
         )
         self.btn_add_project.grid(row=2, column=0, padx=16, pady=(0, 12), sticky="ew")
@@ -689,7 +1001,13 @@ class AIPlatformApp(ctk.CTk):
         self.project_list_frame = ctk.CTkScrollableFrame(self.sidebar, corner_radius=10)
         self.project_list_frame.grid(row=3, column=0, padx=12, pady=(0, 8), sticky="nsew")
 
-        self.project_status_label = ctk.CTkLabel(self.sidebar, text="", text_color="#8f8f8f", justify="left")
+        self.project_status_label = ctk.CTkLabel(
+            self.sidebar,
+            text="",
+            text_color="#8f8f8f",
+            justify="left",
+            font=self.ui_font("sidebar_body"),
+        )
         self.project_status_label.grid(row=4, column=0, padx=16, pady=(0, 16), sticky="ew")
 
         self.main_frame = ctk.CTkFrame(self, corner_radius=0)
@@ -741,7 +1059,12 @@ class AIPlatformApp(ctk.CTk):
             self.project_user_label.configure(text="目前使用者: 未選擇")
             self.project_status_label.configure(text="請先建立使用者後再新增專案資料夾", text_color="orange")
             self.btn_add_project.configure(state="disabled")
-            empty_label = ctk.CTkLabel(self.project_list_frame, text="尚無使用者", text_color="#9f9f9f")
+            empty_label = ctk.CTkLabel(
+                self.project_list_frame,
+                text="尚無使用者",
+                text_color="#9f9f9f",
+                font=self.ui_font("sidebar_body"),
+            )
             empty_label.pack(anchor="w", padx=8, pady=8)
             return
 
@@ -756,7 +1079,12 @@ class AIPlatformApp(ctk.CTk):
 
         if not projects:
             self.project_status_label.configure(text="尚未建立專案資料夾", text_color="#9f9f9f")
-            empty_label = ctk.CTkLabel(self.project_list_frame, text="尚無專案資料夾", text_color="#9f9f9f")
+            empty_label = ctk.CTkLabel(
+                self.project_list_frame,
+                text="尚無專案資料夾",
+                text_color="#9f9f9f",
+                font=self.ui_font("sidebar_body"),
+            )
             empty_label.pack(anchor="w", padx=8, pady=8)
             return
 
@@ -775,6 +1103,7 @@ class AIPlatformApp(ctk.CTk):
                 fg_color="transparent",
                 hover_color="#315b82" if is_active else "#2d2f35",
                 anchor="w",
+                font=self.ui_font("sidebar_body"),
                 command=lambda project_item=project: self.select_project(project_item),
             )
             item_button.pack(fill="x", padx=8, pady=(8, 2))
@@ -786,6 +1115,7 @@ class AIPlatformApp(ctk.CTk):
                 anchor="w",
                 justify="left",
                 wraplength=220,
+                font=self.ui_font("sidebar_body"),
             )
             path_label.pack(fill="x", padx=14, pady=(0, 10))
 
@@ -828,11 +1158,40 @@ class AIPlatformApp(ctk.CTk):
         widget.configure(text=text, text_color=color)
 
     def configure_chat_display(self):
-        self.chat_bubble_max_width = 620
-        self.chat_text_wrap = self.chat_bubble_max_width - 100
-        self.input_min_height = 44
+        self.chat_bubble_max_width = self.chat_bubble_setting_width
+        self.chat_content_width = max(360, self.chat_bubble_max_width - 56)
+        self.chat_text_wrap = self.chat_content_width
+        self.input_min_height = max(44, self.ui_font_sizes.get("input", 14) * 3)
         self.input_max_height = 156
         self.input_wrap_chars = 52
+
+    def copy_text_to_clipboard(self, text, button=None):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        if button:
+            button.configure(text="已複製")
+            button.after(1200, lambda: button.configure(text="複製"))
+
+    def get_chat_item_copy_text(self, normalized):
+        parts = []
+        content = self.format_display_value(normalized["content"])
+        if content:
+            parts.append(content)
+
+        for section in normalized["sections"] or []:
+            if isinstance(section, dict):
+                title = section.get("title", "")
+                section_content = self.format_display_value(section.get("content", ""))
+                if title and section_content:
+                    parts.append(f"[{title}]\n{section_content}")
+                elif section_content:
+                    parts.append(section_content)
+            else:
+                section_text = self.format_display_value(section)
+                if section_text:
+                    parts.append(section_text)
+
+        return "\n\n".join(parts).strip()
 
     def clear_chat_display(self):
         for widget in self.chat_display.winfo_children():
@@ -946,6 +1305,7 @@ class AIPlatformApp(ctk.CTk):
                 self.conversation_history_frame,
                 text="尚無歷史對話",
                 text_color="#9f9f9f",
+                font=self.ui_font("control"),
             )
             empty_label.pack(anchor="w", padx=8, pady=8)
             self.update_batch_delete_button_state()
@@ -983,6 +1343,7 @@ class AIPlatformApp(ctk.CTk):
                 fg_color="transparent",
                 hover_color="#315b82" if is_active else "#2d2f35",
                 anchor="w",
+                font=self.ui_font("control"),
                 command=lambda conversation_item_id=conversation_id: self.open_conversation_by_id(conversation_item_id),
             )
             open_button.pack(side="left", fill="x", expand=True)
@@ -991,7 +1352,7 @@ class AIPlatformApp(ctk.CTk):
                 top_row,
                 text=conversation[3][:16].replace("T", " "),
                 text_color="#9ea7b3",
-                font=ctk.CTkFont(size=11),
+                font=self.ui_font("chat_meta"),
             )
             timestamp_label.pack(side="right", padx=(8, 2))
 
@@ -1069,6 +1430,180 @@ class AIPlatformApp(ctk.CTk):
 
         return str(value)
 
+    def is_markdown_table_separator(self, line):
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells)
+
+    def is_markdown_table_line(self, line):
+        return line.strip().startswith("|") and line.strip().endswith("|") and line.count("|") >= 2
+
+    def parse_markdown_table(self, lines):
+        rows = []
+        for line in lines:
+            if self.is_markdown_table_separator(line):
+                continue
+            rows.append([cell.strip() for cell in line.strip().strip("|").split("|")])
+        if not rows:
+            return []
+        column_count = max(len(row) for row in rows)
+        return [row + [""] * (column_count - len(row)) for row in rows]
+
+    def clean_inline_markdown(self, text):
+        cleaned = text.strip()
+        cleaned = cleaned.replace("\\rightarrow", "->").replace("\\Rightarrow", "=>")
+        cleaned = re.sub(r"\$(.*?)\$", r"\1", cleaned)
+        cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+        cleaned = re.sub(r"\*(.*?)\*", r"\1", cleaned)
+        cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+        return cleaned
+
+    def looks_like_formula_or_operator_block(self, text):
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if stripped.startswith(("{", "[")):
+            return True
+        if "```" in stripped or "$$" in stripped or "\\[" in stripped or "\\(" in stripped:
+            return True
+        if re.search(r"^\s*[-*]\s+", stripped, re.MULTILINE):
+            return False
+        if re.search(r"\*\*.*?\*\*", stripped):
+            return False
+        operator_pattern = r"(<=|>=|==|!=|=>|->|<-|=|≤|≥|≠|≈|×|÷|√|∑|∫|∆|∂|π|∞|\^)"
+        lines = [line for line in stripped.splitlines() if line.strip()]
+        operator_lines = sum(1 for line in lines if re.search(operator_pattern, line))
+        return operator_lines >= 2 or (operator_lines == 1 and len(stripped) <= 120)
+
+    def split_rich_text_blocks(self, text):
+        lines = text.splitlines()
+        blocks = []
+        current_text = []
+        index = 0
+        in_code = False
+        code_lines = []
+
+        def flush_text():
+            if current_text:
+                block_text = "\n".join(current_text).strip("\n")
+                if block_text:
+                    block_type = "mono" if self.looks_like_formula_or_operator_block(block_text) else "text"
+                    blocks.append((block_type, block_text))
+                current_text.clear()
+
+        while index < len(lines):
+            line = lines[index]
+            if line.strip().startswith("```"):
+                if in_code:
+                    code_lines.append(line)
+                    blocks.append(("mono", "\n".join(code_lines).strip("\n")))
+                    code_lines = []
+                    in_code = False
+                else:
+                    flush_text()
+                    code_lines = [line]
+                    in_code = True
+                index += 1
+                continue
+
+            if in_code:
+                code_lines.append(line)
+                index += 1
+                continue
+
+            if self.is_markdown_table_line(line):
+                flush_text()
+                table_lines = []
+                while index < len(lines) and self.is_markdown_table_line(lines[index]):
+                    table_lines.append(lines[index])
+                    index += 1
+                blocks.append(("table", self.parse_markdown_table(table_lines)))
+                continue
+
+            current_text.append(line)
+            index += 1
+
+        if code_lines:
+            blocks.append(("mono", "\n".join(code_lines).strip("\n")))
+        flush_text()
+        return blocks or [("text", text)]
+
+    def estimate_textbox_height(self, text, min_height=54, max_height=260):
+        line_count = max(1, len(text.splitlines()))
+        longest_line = max((len(line) for line in text.splitlines()), default=0)
+        wrapped_extra = max(0, longest_line // 92)
+        return max(min_height, min(max_height, (line_count + wrapped_extra) * 22 + 24))
+
+    def render_table_content(self, parent, rows, style, padx=14, pady=(0, 8)):
+        if not rows:
+            return
+
+        column_count = max(len(row) for row in rows)
+        cell_width = max(120, int((self.chat_content_width - 16) / max(1, column_count)))
+        table_frame = ctk.CTkFrame(parent, fg_color="#171717", border_width=1, border_color="#555555", corner_radius=8)
+        table_frame.pack(fill="x", padx=padx, pady=pady)
+
+        for column_index in range(column_count):
+            table_frame.grid_columnconfigure(column_index, weight=1, uniform="chat_table")
+
+        for row_index, row in enumerate(rows):
+            is_header = row_index == 0
+            for column_index in range(column_count):
+                cell_text = self.clean_inline_markdown(row[column_index] if column_index < len(row) else "")
+                cell_frame = ctk.CTkFrame(
+                    table_frame,
+                    fg_color="#2f2f2f" if is_header else "#1f1f1f",
+                    corner_radius=0,
+                    border_width=1,
+                    border_color="#4c4c4c",
+                )
+                cell_frame.grid(row=row_index, column=column_index, sticky="nsew", padx=0, pady=0)
+                cell_label = ctk.CTkLabel(
+                    cell_frame,
+                    text=cell_text,
+                    text_color=style["text_color"],
+                    font=self.ui_font("chat_body", "bold" if is_header else None),
+                    anchor="w",
+                    justify="left",
+                    width=cell_width,
+                    wraplength=max(90, cell_width - 18),
+                )
+                cell_label.pack(fill="both", expand=True, padx=8, pady=7)
+
+    def render_text_content(self, parent, text, style, padx=14, pady=(0, 8)):
+        for block_type, block_text in self.split_rich_text_blocks(text):
+            if block_type == "table":
+                self.render_table_content(parent, block_text, style, padx=padx, pady=pady)
+                continue
+
+            if block_type == "mono":
+                textbox = ctk.CTkTextbox(
+                    parent,
+                    width=self.chat_content_width,
+                    height=self.estimate_textbox_height(block_text),
+                    wrap="none",
+                    font=ctk.CTkFont(family="Consolas", size=self.ui_font_sizes.get("chat_body", 14)),
+                    text_color=style["text_color"],
+                    fg_color="#171717",
+                    border_color="#555555",
+                    border_width=1,
+                    corner_radius=8,
+                )
+                textbox.pack(fill="x", padx=padx, pady=pady)
+                textbox.insert("1.0", block_text)
+                textbox.configure(state="disabled")
+                continue
+
+            label = ctk.CTkLabel(
+                parent,
+                text=self.clean_inline_markdown(block_text),
+                text_color=style["text_color"],
+                font=self.ui_font("chat_body"),
+                anchor="w",
+                justify="left",
+                wraplength=self.chat_text_wrap,
+            )
+            label.pack(fill="x", padx=padx, pady=pady)
+
     def normalize_chat_item(self, item, default_role="assistant", default_kind="message"):
         if isinstance(item, str):
             return {
@@ -1100,6 +1635,22 @@ class AIPlatformApp(ctk.CTk):
             "meta": item.get("meta", {}),
             "sections": item.get("sections", []),
             "timestamp": item.get("timestamp", ""),
+        }
+
+    def build_ai_response_item(self, response, provider, timestamp=""):
+        return {
+            "role": "assistant",
+            "kind": "result",
+            "title": "AI 回覆",
+            "content": "",
+            "timestamp": timestamp,
+            "meta": {"provider": provider[1], "model": provider[5]},
+            "sections": [
+                {
+                    "title": "",
+                    "content": response,
+                },
+            ],
         }
 
     def render_chat_item(self, item):
@@ -1135,17 +1686,18 @@ class AIPlatformApp(ctk.CTk):
         kind = normalized["kind"]
         side = "right" if role == "user" else "left"
 
+        theme_styles = self.get_chat_theme_styles()
         bubble_styles = {
-            "user": {"fg_color": "#1f6aa5", "text_color": "#ffffff", "header_color": "#d9ecff"},
-            "assistant": {"fg_color": "#2b2b2b", "text_color": "#f2f2f2", "header_color": "#9fd3a8"},
-            "system": {"fg_color": "#3a2f1e", "text_color": "#fff4d6", "header_color": "#f8d27a"},
-            "tool": {"fg_color": "#2a2438", "text_color": "#efe7ff", "header_color": "#c8b8ff"},
+            "user": theme_styles["user"],
+            "assistant": theme_styles["assistant"],
+            "system": theme_styles["system"],
+            "tool": theme_styles["tool"],
         }
         kind_overrides = {
-            "error": {"fg_color": "#4a1f1f", "text_color": "#ffd6d6", "header_color": "#ff9d9d"},
-            "warning": {"fg_color": "#4a3b12", "text_color": "#fff0c7", "header_color": "#ffd36f"},
-            "status": {"fg_color": "#1f2f45", "text_color": "#dbeafe", "header_color": "#93c5fd"},
-            "result": {"fg_color": "#203529", "text_color": "#dbffe7", "header_color": "#8de1aa"},
+            "error": {"fg_color": "#3d3d3d", "text_color": "#ffffff", "header_color": "#ffffff"},
+            "warning": {"fg_color": "#363636", "text_color": "#f7f7f7", "header_color": "#ffffff"},
+            "status": {"fg_color": "#303030", "text_color": "#eeeeee", "header_color": "#f2f2f2"},
+            "result": theme_styles["assistant"],
         }
 
         style = dict(bubble_styles.get(role, bubble_styles["assistant"]))
@@ -1158,18 +1710,37 @@ class AIPlatformApp(ctk.CTk):
             row_frame,
             fg_color=style["fg_color"],
             corner_radius=14,
+            width=self.chat_bubble_max_width,
         )
         bubble_frame.pack(side=side, anchor="e" if side == "right" else "w", padx=10)
 
+        header_row = ctk.CTkFrame(bubble_frame, fg_color="transparent")
+        header_row.pack(fill="x", padx=14, pady=(10, 2))
+
         header_label = ctk.CTkLabel(
-            bubble_frame,
+            header_row,
             text=" | ".join(header_parts),
             text_color=style["header_color"],
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=self.ui_font("chat_meta", "bold"),
             anchor="w",
             justify="left",
         )
-        header_label.pack(fill="x", padx=14, pady=(10, 2))
+        header_label.pack(side="left", fill="x", expand=True)
+
+        copy_text = self.get_chat_item_copy_text(normalized)
+        if copy_text:
+            copy_button = ctk.CTkButton(
+                header_row,
+                text="複製",
+                width=58,
+                height=24,
+                font=self.ui_font("chat_meta"),
+                fg_color=theme_styles["copy"]["fg_color"],
+                hover_color=theme_styles["copy"]["hover_color"],
+                text_color=theme_styles["copy"]["text_color"],
+            )
+            copy_button.configure(command=lambda text=copy_text, button=copy_button: self.copy_text_to_clipboard(text, button))
+            copy_button.pack(side="right", padx=(8, 0))
 
         meta = normalized["meta"] or {}
         if isinstance(meta, dict) and meta:
@@ -1179,7 +1750,7 @@ class AIPlatformApp(ctk.CTk):
                     bubble_frame,
                     text=meta_line,
                     text_color="#c7c7c7",
-                    font=ctk.CTkFont(size=11),
+                    font=self.ui_font("chat_meta"),
                     anchor="w",
                     justify="left",
                     wraplength=self.chat_text_wrap,
@@ -1188,29 +1759,16 @@ class AIPlatformApp(ctk.CTk):
 
         content = self.format_display_value(normalized["content"])
         if content:
-            content_label = ctk.CTkLabel(
-                bubble_frame,
-                text=content,
-                text_color=style["text_color"],
-                font=ctk.CTkFont(size=14),
-                anchor="w",
-                justify="left",
-                wraplength=self.chat_text_wrap,
-            )
-            content_label.pack(fill="x", padx=14, pady=(0, 8))
+            self.render_text_content(bubble_frame, content, style)
 
         for section in normalized["sections"] or []:
             if not isinstance(section, dict):
-                section_label = ctk.CTkLabel(
+                self.render_text_content(
                     bubble_frame,
-                    text=self.format_display_value(section),
-                    text_color=style["text_color"],
-                    font=ctk.CTkFont(size=13),
-                    anchor="w",
-                    justify="left",
-                    wraplength=self.chat_text_wrap,
+                    self.format_display_value(section),
+                    style,
+                    pady=(0, 6),
                 )
-                section_label.pack(fill="x", padx=14, pady=(0, 6))
                 continue
 
             section_title = section.get("title", "")
@@ -1221,22 +1779,13 @@ class AIPlatformApp(ctk.CTk):
                     bubble_frame,
                     text=f"[{section_title}]",
                     text_color=style["header_color"],
-                    font=ctk.CTkFont(size=12, weight="bold"),
+                    font=self.ui_font("chat_meta", "bold"),
                     anchor="w",
                     justify="left",
                 )
                 section_title_label.pack(fill="x", padx=14, pady=(2, 2))
             if section_content:
-                section_content_label = ctk.CTkLabel(
-                    bubble_frame,
-                    text=section_content,
-                    text_color=style["text_color"],
-                    font=ctk.CTkFont(size=13),
-                    anchor="w",
-                    justify="left",
-                    wraplength=self.chat_text_wrap,
-                )
-                section_content_label.pack(fill="x", padx=14, pady=(0, 6))
+                self.render_text_content(bubble_frame, section_content, style, pady=(0, 6))
 
         self.update_idletasks()
         if hasattr(self.chat_display, "_parent_canvas"):
@@ -1246,25 +1795,26 @@ class AIPlatformApp(ctk.CTk):
         return [provider[1] for provider in get_providers()]
 
     def show_chat(self):
+        self.current_view = "chat"
         self.clear_main()
         self.set_active_nav("chat")
 
         title = ctk.CTkLabel(
             self.main_frame,
             text="AI 對話區",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self.ui_font("page_title", "bold"),
         )
         title.pack(pady=10)
 
         toolbar_frame = ctk.CTkFrame(self.main_frame)
         toolbar_frame.pack(padx=20, pady=10, fill="x")
 
-        ctk.CTkLabel(toolbar_frame, text="使用者").pack(side="left", padx=(10, 6))
+        ctk.CTkLabel(toolbar_frame, text="使用者", font=self.ui_font("control")).pack(side="left", padx=(10, 6))
         self.user_var = ctk.StringVar()
         self.user_combo = ctk.CTkComboBox(toolbar_frame, values=[], variable=self.user_var, command=self.on_user_changed, width=220)
         self.user_combo.pack(side="left", padx=(0, 12))
 
-        ctk.CTkLabel(toolbar_frame, text="供應商").pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(toolbar_frame, text="供應商", font=self.ui_font("control")).pack(side="left", padx=(0, 6))
         self.chat_provider_var = ctk.StringVar()
         self.chat_provider_combo = ctk.CTkComboBox(
             toolbar_frame,
@@ -1289,7 +1839,7 @@ class AIPlatformApp(ctk.CTk):
             text="目前對話: 新對話",
             anchor="w",
             text_color="#d8e4f2",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=self.ui_font("control", "bold"),
         )
         self.current_conversation_label.pack(side="left", padx=12, pady=8)
 
@@ -1302,7 +1852,7 @@ class AIPlatformApp(ctk.CTk):
         self.history_summary_label = ctk.CTkLabel(
             history_header,
             text="歷史對話",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=self.ui_font("control", "bold"),
         )
         self.history_summary_label.pack(side="left")
 
@@ -1359,7 +1909,12 @@ class AIPlatformApp(ctk.CTk):
         input_row = ctk.CTkFrame(input_frame, fg_color="transparent")
         input_row.pack(fill="x", padx=8, pady=(0, 8))
 
-        self.msg_entry = ctk.CTkTextbox(input_row, height=self.input_min_height, corner_radius=10)
+        self.msg_entry = ctk.CTkTextbox(
+            input_row,
+            height=self.input_min_height,
+            corner_radius=10,
+            font=self.ui_font("input"),
+        )
         self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.msg_entry.bind("<KeyRelease>", self.autosize_input_box)
         self.msg_entry.bind("<Return>", self.on_input_return)
@@ -1382,7 +1937,7 @@ class AIPlatformApp(ctk.CTk):
             self.chat_provider_status.configure(text=f"模型: {active_provider[5]}", text_color="lightgreen")
         else:
             self.chat_provider_combo.set("未設定供應商")
-            self.chat_provider_status.configure(text="請先到系統設定新增供應商", text_color="orange")
+            self.chat_provider_status.configure(text="請先到系統環境設定新增供應商", text_color="orange")
 
     def on_chat_provider_changed(self, event=None):
         provider = get_provider_by_name(self.chat_provider_var.get())
@@ -1463,13 +2018,13 @@ class AIPlatformApp(ctk.CTk):
 
         messages = get_messages(self.current_conversation[0])
         for message in messages:
-            self.render_chat_item(
-                {
-                    "role": message[2],
-                    "content": message[3],
-                    "timestamp": message[4],
-                }
-            )
+            if message[2] == "assistant":
+                provider = get_active_provider()
+                if provider:
+                    self.render_chat_item(self.build_ai_response_item(message[3], provider, message[4]))
+                    continue
+
+            self.render_chat_item({"role": message[2], "content": message[3], "timestamp": message[4]})
 
     def send_message(self, event=None):
         if not self.current_user:
@@ -1482,7 +2037,7 @@ class AIPlatformApp(ctk.CTk):
                 {
                     "role": "system",
                     "kind": "warning",
-                    "content": "請先到「系統設定」新增並驗證 API 供應商",
+                    "content": "請先到「系統環境設定」新增並驗證 API 供應商",
                 }
             )
             return
@@ -1505,14 +2060,31 @@ class AIPlatformApp(ctk.CTk):
 
             message_rows = get_messages(self.current_conversation[0])
             messages = [{"role": row[2], "content": row[3]} for row in message_rows]
+            knowledge_context, knowledge_matches = build_knowledge_context(message_text)
+            if knowledge_context:
+                messages.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": (
+                            "以下是本機向量知識庫檢索到的相關資料。"
+                            "回答時請優先參考這些內容；若資料不足，請明確說明不足之處。\n\n"
+                            f"{knowledge_context}"
+                        ),
+                    },
+                )
 
             self.render_chat_item(
                 {
                     "role": "assistant",
                     "kind": "status",
                     "title": "處理中",
-                    "content": "模型正在處理你的請求。",
-                    "meta": {"provider": provider[1], "model": provider[5]},
+                    "content": "正在產生回答。",
+                    "meta": {
+                        "provider": provider[1],
+                        "model": provider[5],
+                        "knowledge": f"{len(knowledge_matches)} 個片段" if knowledge_matches else "未命中",
+                    },
                 }
             )
             self.update()
@@ -1525,14 +2097,7 @@ class AIPlatformApp(ctk.CTk):
                 messages,
             )
 
-            self.render_chat_item(
-                {
-                    "role": "assistant",
-                    "kind": "result",
-                    "content": response,
-                    "meta": {"provider": provider[1], "model": provider[5]},
-                }
-            )
+            self.render_chat_item(self.build_ai_response_item(response, provider))
             save_message(self.current_conversation[0], "assistant", response)
         except Exception as exc:
             self.render_chat_item(
@@ -1546,34 +2111,35 @@ class AIPlatformApp(ctk.CTk):
             )
 
     def show_users(self):
+        self.current_view = "users"
         self.clear_main()
         self.set_active_nav("users")
 
         title = ctk.CTkLabel(
             self.main_frame,
             text="使用者資料區",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self.ui_font("page_title", "bold"),
         )
         title.pack(pady=10)
 
         add_frame = ctk.CTkFrame(self.main_frame)
         add_frame.pack(padx=20, pady=10, fill="x")
 
-        ctk.CTkLabel(add_frame, text="使用者名稱:").pack(side="left", padx=5)
-        self.new_username = ctk.CTkEntry(add_frame, width=200)
+        ctk.CTkLabel(add_frame, text="使用者名稱:", font=self.ui_font("control")).pack(side="left", padx=5)
+        self.new_username = ctk.CTkEntry(add_frame, width=200, font=self.ui_font("control"))
         self.new_username.pack(side="left", padx=5)
 
-        ctk.CTkLabel(add_frame, text="Email:").pack(side="left", padx=5)
-        self.new_email = ctk.CTkEntry(add_frame, width=200)
+        ctk.CTkLabel(add_frame, text="Email:", font=self.ui_font("control")).pack(side="left", padx=5)
+        self.new_email = ctk.CTkEntry(add_frame, width=200, font=self.ui_font("control"))
         self.new_email.pack(side="left", padx=5)
 
-        btn_add = ctk.CTkButton(add_frame, text="建立使用者", command=self.add_new_user)
+        btn_add = ctk.CTkButton(add_frame, text="建立使用者", font=self.ui_font("control"), command=self.add_new_user)
         btn_add.pack(side="left", padx=10)
 
         list_frame = ctk.CTkFrame(self.main_frame)
         list_frame.pack(padx=20, pady=10, fill="both", expand=True)
 
-        self.user_list = ctk.CTkTextbox(list_frame, wrap="word")
+        self.user_list = ctk.CTkTextbox(list_frame, wrap="word", font=self.ui_font("control"))
         self.user_list.pack(padx=10, pady=10, fill="both", expand=True)
 
         self.refresh_user_list()
@@ -1607,14 +2173,16 @@ class AIPlatformApp(ctk.CTk):
             )
 
     def show_settings(self):
+        self.current_view = "settings"
         self.clear_main()
         self.set_active_nav("settings")
 
         title = ctk.CTkLabel(
             self.main_frame,
-            text="系統設定區",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            text="系統環境設定",
+            font=self.ui_font("page_title", "bold"),
         )
+        self.settings_title_label = title
         title.pack(pady=10)
 
         notebook = ctk.CTkTabview(self.main_frame)
@@ -1689,17 +2257,98 @@ class AIPlatformApp(ctk.CTk):
         self.model_result = ctk.CTkTextbox(tab_provider, height=220)
         self.model_result.pack(padx=10, pady=10, fill="both", expand=True)
 
-        tab_system = notebook.add("系統設定")
+        tab_system = notebook.add("系統環境設定")
 
-        ctk.CTkLabel(tab_system, text="預設模型:").pack(padx=10, pady=10, anchor="w")
-        self.sys_model = ctk.CTkEntry(tab_system, width=260)
+        ctk.CTkLabel(tab_system, text="預設模型:", font=self.ui_font("control")).pack(padx=10, pady=10, anchor="w")
+        self.sys_model = ctk.CTkEntry(tab_system, width=260, font=self.ui_font("control"))
         self.sys_model.pack(padx=10, pady=5, anchor="w")
         self.sys_model.insert(0, get_setting("default_model", ""))
 
-        btn_save_sys = ctk.CTkButton(tab_system, text="儲存系統設定", command=self.save_system_settings)
+        font_frame = ctk.CTkFrame(tab_system)
+        font_frame.pack(padx=10, pady=(16, 10), fill="x")
+
+        ctk.CTkLabel(
+            font_frame,
+            text="UI 字體大小",
+            font=self.ui_font("control", "bold"),
+        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w")
+
+        self.font_size_vars = {}
+        for row_index, (key, label) in enumerate(UI_FONT_LABELS.items(), start=1):
+            ctk.CTkLabel(font_frame, text=label, font=self.ui_font("control")).grid(
+                row=row_index,
+                column=0,
+                padx=10,
+                pady=5,
+                sticky="w",
+            )
+            value_var = ctk.StringVar(value=str(self.ui_font_sizes.get(key, UI_FONT_DEFAULTS[key])))
+            self.font_size_vars[key] = value_var
+            size_entry = ctk.CTkEntry(font_frame, width=72, textvariable=value_var, font=self.ui_font("control"))
+            size_entry.grid(row=row_index, column=1, padx=10, pady=5, sticky="w")
+            ctk.CTkLabel(font_frame, text="px", text_color="#a8a8a8", font=self.ui_font("control")).grid(
+                row=row_index,
+                column=2,
+                padx=(0, 10),
+                pady=5,
+                sticky="w",
+            )
+
+        chat_frame = ctk.CTkFrame(tab_system)
+        chat_frame.pack(padx=10, pady=(8, 10), fill="x")
+
+        ctk.CTkLabel(
+            chat_frame,
+            text="對話區顯示",
+            font=self.ui_font("control", "bold"),
+        ).grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 6), sticky="w")
+
+        ctk.CTkLabel(chat_frame, text="訊息顯示寬度", font=self.ui_font("control")).grid(
+            row=1,
+            column=0,
+            padx=10,
+            pady=5,
+            sticky="w",
+        )
+        self.chat_width_var = ctk.StringVar(value=str(self.chat_bubble_setting_width))
+        self.chat_width_entry = ctk.CTkEntry(
+            chat_frame,
+            width=90,
+            textvariable=self.chat_width_var,
+            font=self.ui_font("control"),
+        )
+        self.chat_width_entry.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(chat_frame, text="對話配色", font=self.ui_font("control")).grid(
+            row=2,
+            column=0,
+            padx=10,
+            pady=5,
+            sticky="w",
+        )
+        self.chat_theme_var = ctk.StringVar(value=self.chat_color_theme)
+        self.chat_theme_combo = ctk.CTkComboBox(
+            chat_frame,
+            values=CHAT_THEME_OPTIONS,
+            variable=self.chat_theme_var,
+            width=160,
+            font=self.ui_font("control"),
+        )
+        self.chat_theme_combo.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+
+        self.font_settings_status = ctk.CTkLabel(tab_system, text="", font=self.ui_font("control"))
+        self.font_settings_status.pack(padx=10, pady=(0, 6), anchor="w")
+
+        btn_save_sys = ctk.CTkButton(
+            tab_system,
+            text="儲存系統環境設定",
+            font=self.ui_font("control"),
+            command=self.save_system_settings,
+        )
         btn_save_sys.pack(padx=10, pady=10, anchor="w")
 
         self.refresh_provider_controls()
+        self.apply_font_to_tree(notebook)
 
     def refresh_provider_controls(self):
         providers = get_providers()
@@ -1841,36 +2490,82 @@ class AIPlatformApp(ctk.CTk):
 
     def save_system_settings(self):
         save_setting("default_model", self.sys_model.get().strip())
+        new_sizes = {}
+        for key, default_size in UI_FONT_DEFAULTS.items():
+            value_var = self.font_size_vars.get(key)
+            raw_value = value_var.get().strip() if value_var else str(default_size)
+            try:
+                size = int(raw_value)
+            except ValueError:
+                size = default_size
+            size = max(9, min(32, size))
+            save_setting(f"ui_font_{key}", str(size))
+            new_sizes[key] = size
+
+        raw_chat_width = self.chat_width_var.get().strip() if hasattr(self, "chat_width_var") else str(self.chat_bubble_setting_width)
+        try:
+            chat_width = int(raw_chat_width)
+        except ValueError:
+            chat_width = 860
+        chat_width = max(520, min(1100, chat_width))
+        chat_theme = self.chat_theme_var.get().strip() if hasattr(self, "chat_theme_var") else self.chat_color_theme
+        chat_theme = chat_theme if chat_theme in CHAT_THEME_STYLES else "黑灰白"
+        save_setting("chat_bubble_width", str(chat_width))
+        save_setting("chat_color_theme", chat_theme)
+
+        self.ui_font_sizes = new_sizes
+        self.chat_bubble_setting_width = chat_width
+        self.chat_color_theme = chat_theme
+        self.configure_chat_display()
+        self.apply_ui_fonts()
+        self.apply_font_to_tree(self.main_frame)
+        if hasattr(self, "settings_title_label"):
+            self.settings_title_label.configure(font=self.ui_font("page_title", "bold"))
+        if hasattr(self, "chat_width_var"):
+            self.chat_width_var.set(str(chat_width))
+        if hasattr(self, "chat_theme_var"):
+            self.chat_theme_var.set(chat_theme)
+        if hasattr(self, "font_settings_status"):
+            self.font_settings_status.configure(text="已儲存系統環境設定，UI 字體與對話區顯示已套用。", text_color="lightgreen")
 
     def show_knowledge(self):
+        self.current_view = "knowledge"
         self.clear_main()
         self.set_active_nav("knowledge")
 
         title = ctk.CTkLabel(
             self.main_frame,
             text="知識庫",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self.ui_font("page_title", "bold"),
         )
         title.pack(pady=10)
 
         upload_frame = ctk.CTkFrame(self.main_frame)
         upload_frame.pack(padx=20, pady=10, fill="x")
 
-        ctk.CTkLabel(upload_frame, text="選擇文件:").pack(side="left", padx=5)
+        ctk.CTkLabel(upload_frame, text="選擇文件:", font=self.ui_font("control")).pack(side="left", padx=5)
 
-        self.kb_file = ctk.CTkButton(upload_frame, text="選擇檔案...", command=self.select_file)
+        self.kb_file = ctk.CTkButton(upload_frame, text="選擇檔案...", font=self.ui_font("control"), command=self.select_file)
         self.kb_file.pack(side="left", padx=5)
 
-        self.kb_filename = ctk.CTkLabel(upload_frame, text="")
+        self.kb_filename = ctk.CTkLabel(upload_frame, text="", font=self.ui_font("control"))
         self.kb_filename.pack(side="left", padx=5)
 
-        self.btn_upload_kb = ctk.CTkButton(upload_frame, text="上傳", command=self.upload_knowledge)
+        self.btn_upload_kb = ctk.CTkButton(
+            upload_frame,
+            text="上傳並向量化",
+            font=self.ui_font("control"),
+            command=self.upload_knowledge,
+        )
         self.btn_upload_kb.pack(side="left", padx=5)
+
+        self.kb_status_label = ctk.CTkLabel(upload_frame, text="", font=self.ui_font("control"))
+        self.kb_status_label.pack(side="left", padx=10)
 
         list_frame = ctk.CTkFrame(self.main_frame)
         list_frame.pack(padx=20, pady=10, fill="both", expand=True)
 
-        self.kb_list = ctk.CTkTextbox(list_frame, wrap="word")
+        self.kb_list = ctk.CTkTextbox(list_frame, wrap="word", font=self.ui_font("control"))
         self.kb_list.pack(padx=10, pady=10, fill="both", expand=True)
 
         self.refresh_knowledge_list()
@@ -1890,36 +2585,56 @@ class AIPlatformApp(ctk.CTk):
             return
 
         try:
-            with open(self.selected_file, encoding="utf-8", errors="ignore") as file_handle:
-                content = file_handle.read()
-            save_knowledge_doc(os.path.basename(self.selected_file), content)
+            filename = os.path.basename(self.selected_file)
+            timestamp_prefix = datetime.now().strftime("%Y%m%d%H%M%S")
+            stored_filename = f"{timestamp_prefix}_{filename}"
+            stored_path = os.path.join(KB_SOURCE_DIR, stored_filename)
+            shutil.copy2(self.selected_file, stored_path)
+
+            content = read_text_file(stored_path)
+            doc_id = save_knowledge_doc(filename, content, stored_path)
+            chunk_count = vectorize_knowledge_doc(doc_id, filename, content)
+            self.kb_status_label.configure(
+                text=f"已上傳並建立 {chunk_count} 個向量片段",
+                text_color="lightgreen",
+            )
             self.refresh_knowledge_list()
         except Exception as exc:
+            if hasattr(self, "kb_status_label"):
+                self.kb_status_label.configure(text="向量處理失敗", text_color="red")
             self.kb_list.insert("end", f"錯誤: {exc}\n")
 
     def refresh_knowledge_list(self):
         self.kb_list.delete("1.0", "end")
+        self.kb_list.insert("end", f"本機向量索引: {get_local_vector_stats()} 個片段\n")
+        chroma_path = os.path.join(KB_DIR, "chroma.sqlite3")
+        if os.path.exists(chroma_path):
+            self.kb_list.insert("end", "偵測到既有 Chroma 向量庫: knowledge_base/chroma.sqlite3\n")
+        self.kb_list.insert("end", "\n")
         for document in get_knowledge_docs():
+            chunk_count = document[5] if len(document) > 5 and document[5] is not None else 0
+            vector_status = document[6] if len(document) > 6 and document[6] else "unknown"
             self.kb_list.insert(
                 "end",
-                f"• {document[1]} - 上傳於 {document[3]}\n",
+                f"• {document[1]} - 上傳於 {document[3]} - 向量狀態: {vector_status} / {chunk_count} chunks\n",
             )
 
     def show_tools(self):
+        self.current_view = "tools"
         self.clear_main()
         self.set_active_nav("tools")
 
         title = ctk.CTkLabel(
             self.main_frame,
             text="AI Tools & Skills",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self.ui_font("page_title", "bold"),
         )
         title.pack(pady=10)
 
         info_frame = ctk.CTkFrame(self.main_frame)
         info_frame.pack(padx=20, pady=10, fill="x")
 
-        ctk.CTkLabel(info_frame, text="可用工具:", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
+        ctk.CTkLabel(info_frame, text="可用工具:", font=self.ui_font("control", "bold")).pack(anchor="w", padx=10, pady=5)
         tools = [
             "• 資料庫查詢 - AI 可直接查詢 SQLite 資料庫",
             "• 執行指令 - AI 可執行系統指令",
@@ -1927,29 +2642,29 @@ class AIPlatformApp(ctk.CTk):
             "• 天氣查詢 - 查詢天氣資訊",
         ]
         for tool_text in tools:
-            ctk.CTkLabel(info_frame, text=tool_text).pack(anchor="w", padx=20)
+            ctk.CTkLabel(info_frame, text=tool_text, font=self.ui_font("control")).pack(anchor="w", padx=20)
 
-        ctk.CTkLabel(info_frame, text="可用 Skills:", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(20, 5))
+        ctk.CTkLabel(info_frame, text="可用 Skills:", font=self.ui_font("control", "bold")).pack(anchor="w", padx=10, pady=(20, 5))
         skills = [
             "• Code Interpreter - 執行 Python 程式碼",
             "• Web Search - 搜尋網路",
             "• Knowledge Retrieval - 從知識庫擷取資訊",
         ]
         for skill_text in skills:
-            ctk.CTkLabel(info_frame, text=skill_text).pack(anchor="w", padx=20)
+            ctk.CTkLabel(info_frame, text=skill_text, font=self.ui_font("control")).pack(anchor="w", padx=20)
 
         test_frame = ctk.CTkFrame(self.main_frame)
         test_frame.pack(padx=20, pady=10, fill="x")
 
-        ctk.CTkLabel(test_frame, text="SQL 測試:").pack(side="left", padx=5)
-        self.sql_test = ctk.CTkEntry(test_frame, width=320)
+        ctk.CTkLabel(test_frame, text="SQL 測試:", font=self.ui_font("control")).pack(side="left", padx=5)
+        self.sql_test = ctk.CTkEntry(test_frame, width=320, font=self.ui_font("control"))
         self.sql_test.pack(side="left", padx=5)
         self.sql_test.insert(0, "SELECT * FROM users")
 
-        btn_test = ctk.CTkButton(test_frame, text="執行", command=self.test_sql)
+        btn_test = ctk.CTkButton(test_frame, text="執行", font=self.ui_font("control"), command=self.test_sql)
         btn_test.pack(side="left", padx=5)
 
-        self.sql_result = ctk.CTkTextbox(self.main_frame, height=220)
+        self.sql_result = ctk.CTkTextbox(self.main_frame, height=220, font=self.ui_font("control"))
         self.sql_result.pack(padx=20, pady=10, fill="both", expand=True)
 
     def test_sql(self):
