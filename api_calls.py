@@ -1,3 +1,5 @@
+import json
+
 import requests
 
 AZURE_OPENAI_API_VERSION = "2024-10-21"
@@ -8,7 +10,7 @@ def normalize_base_url(base_url: str) -> str:
 
 
 def provider_requires_api_key(api_type: str) -> bool:
-    return api_type not in ("Ollama",)
+    return api_type not in ("Ollama", "LM Studio")
 
 
 def format_error(prefix: str, response) -> str:
@@ -114,6 +116,64 @@ def call_openai(api_key: str, base_url: str, model: str, messages) -> str:
         return f"連線錯誤: {str(exc)}"
 
 
+def call_openai_with_tools(api_key: str, base_url: str, model: str, messages, tools, tool_handler) -> str:
+    from tools import handle_tool_call, _get_project_root
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    project_root = _get_project_root(messages)
+    max_turns = 10
+
+    for turn in range(max_turns):
+        data = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 4000,
+        }
+        if tools:
+            data["tools"] = tools
+
+        try:
+            response = requests.post(
+                f"{normalize_base_url(base_url)}/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=120,
+            )
+            if response.status_code != 200:
+                return format_error("API 錯誤", response)
+
+            payload = response.json()
+            choice = payload["choices"][0]
+            msg = choice["message"]
+
+            if not msg.get("tool_calls"):
+                return msg.get("content", "")
+
+            messages.append({
+                "role": "assistant",
+                "content": msg.get("content") or "",
+                "tool_calls": msg["tool_calls"],
+            })
+
+            for tc in msg["tool_calls"]:
+                fn = tc["function"]
+                try:
+                    fn_args = json.loads(fn["arguments"])
+                except json.JSONDecodeError:
+                    fn_args = {}
+                result = handle_tool_call(fn["name"], fn_args, project_root)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+        except Exception as exc:
+            return f"連線錯誤: {str(exc)}"
+
+    return "工具呼叫超過最大次數，請簡化操作。"
+
+
 def call_azure_openai(api_key: str, base_url: str, deployment_name: str, messages) -> str:
     headers = {"api-key": api_key, "Content-Type": "application/json"}
     data = {"messages": messages, "max_tokens": 2000}
@@ -194,7 +254,7 @@ def call_ollama(base_url: str, model: str, messages) -> str:
         response = requests.post(
             f"{normalize_base_url(base_url)}/api/chat",
             json=data,
-            timeout=120,
+            timeout=300,
         )
         if response.status_code == 200:
             return response.json()["message"]["content"]
@@ -232,7 +292,7 @@ def call_google(api_key: str, base_url: str, model: str, messages) -> str:
 
 
 def call_provider(api_type: str, api_key: str, base_url: str, model: str, messages) -> str:
-    if api_type in ("OpenAI", "Custom"):
+    if api_type in ("OpenAI", "Custom", "LM Studio"):
         return call_openai(api_key, base_url, model, messages)
     if api_type == "Azure OpenAI":
         return call_azure_openai(api_key, base_url, model, messages)
@@ -243,6 +303,14 @@ def call_provider(api_type: str, api_key: str, base_url: str, model: str, messag
     if api_type == "Google Gemini":
         return call_google(api_key, base_url, model, messages)
     return f"不支援的供應商類型: {api_type}"
+
+
+def call_provider_with_tools(api_type: str, api_key: str, base_url: str, model: str, messages, tools, tool_handler=None) -> str:
+    if api_type in ("OpenAI", "Custom", "LM Studio"):
+        return call_openai_with_tools(api_key, base_url, model, messages, tools, tool_handler)
+    if api_type == "Azure OpenAI":
+        return call_openai_with_tools(api_key, base_url, model, messages, tools, tool_handler)
+    return call_provider(api_type, api_key, base_url, model, messages)
 
 
 def verify_provider_config(api_type: str, api_key: str, base_url: str, model: str):
@@ -267,7 +335,7 @@ def fetch_models_for_provider(api_type: str, api_key: str, base_url: str):
         return False, "請先輸入 Base URL", []
 
     try:
-        if api_type in ("OpenAI", "Custom"):
+        if api_type in ("OpenAI", "Custom", "LM Studio"):
             response = requests.get(
                 f"{normalize_base_url(base_url)}/models",
                 headers={"Authorization": f"Bearer {api_key}"},

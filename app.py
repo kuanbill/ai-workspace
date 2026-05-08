@@ -6,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import threading
+from collections import defaultdict
 from datetime import datetime
 from tkinter import filedialog
 
@@ -14,7 +15,8 @@ from PIL import Image
 
 import customtkinter as ctk
 
-from api_calls import call_provider, fetch_models_for_provider, provider_requires_api_key, verify_provider_config
+from api_calls import call_provider, call_provider_with_tools, fetch_models_for_provider, provider_requires_api_key, verify_provider_config
+from tools import TOOLS_SCHEMA
 from config import (
     get_chat_bubble_width, get_chat_color_theme, get_ui_font_sizes,
     save_chat_bubble_width, save_chat_color_theme, save_ui_font_sizes,
@@ -31,6 +33,7 @@ from knowledge import (
     backup_knowledge, build_knowledge_context, get_local_vector_stats,
     read_text_file, restore_knowledge, vectorize_knowledge_doc,
 )
+from skills import build_skill_context
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -212,6 +215,15 @@ class AIPlatformApp(ctk.CTk):
         )
         self.project_title.grid(row=0, column=0, padx=16, pady=(18, 8), sticky="w")
 
+        self.btn_refresh_sidebar = ctk.CTkButton(
+            self.sidebar,
+            text="↻",
+            width=36,
+            font=self.ui_font("control"),
+            command=self.refresh_project_sidebar,
+        )
+        self.btn_refresh_sidebar.grid(row=0, column=0, padx=(230, 8), pady=(18, 8), sticky="e")
+
         self.project_user_label = ctk.CTkLabel(
             self.sidebar,
             text="目前使用者: 未選擇",
@@ -274,6 +286,68 @@ class AIPlatformApp(ctk.CTk):
                 button.configure(fg_color="#2f7dc0")
             else:
                 button.configure(fg_color=["#3a7ebf", "#1f538d"])
+
+    _file_categories = {
+        ".py": "Python",
+        ".js": "JavaScript",
+        ".ts": "TypeScript",
+        ".html": "HTML",
+        ".css": "CSS",
+        ".md": "Markdown",
+        ".txt": "Text",
+        ".json": "JSON",
+        ".csv": "CSV",
+        ".xml": "XML",
+        ".yaml": "YAML",
+        ".yml": "YAML",
+        ".toml": "TOML",
+        ".ini": "Config",
+        ".cfg": "Config",
+        ".env": "Env",
+        ".gitignore": "Git",
+        ".png": "Image",
+        ".jpg": "Image",
+        ".jpeg": "Image",
+        ".gif": "Image",
+        ".svg": "Image",
+        ".ico": "Image",
+        ".pdf": "PDF",
+        ".docx": "Word",
+        ".xlsx": "Excel",
+        ".pptx": "PowerPoint",
+        ".zip": "Archive",
+        ".tar": "Archive",
+        ".gz": "Archive",
+        ".exe": "Binary",
+        ".dll": "Binary",
+        ".so": "Binary",
+        ".sh": "Shell",
+        ".bat": "Batch",
+        ".ps1": "PowerShell",
+        ".sql": "SQL",
+        ".lock": "Lock",
+    }
+
+    def _scan_project_files(self, folder_path):
+        categories = defaultdict(list)
+        others = []
+        try:
+            for entry in os.scandir(folder_path):
+                if entry.name.startswith("."):
+                    continue
+                ext = os.path.splitext(entry.name)[1].lower()
+                cat = self._file_categories.get(ext, "其他")
+                if entry.is_dir():
+                    cat = "資料夾"
+                if cat == "其他":
+                    others.append(entry.name)
+                else:
+                    categories[cat].append(entry.name)
+            if others:
+                categories["其他"] = others
+        except Exception:
+            pass
+        return dict(sorted(categories.items()))
 
     def select_project(self, project):
         self.current_project = project
@@ -352,6 +426,53 @@ class AIPlatformApp(ctk.CTk):
         active_path = self.current_project[3] if self.current_project else ""
         self.project_status_label.configure(text=active_path, text_color="#8f8f8f")
 
+        if self.current_project:
+            folder_path = self.current_project[3]
+            allow_file_access = get_setting("allow_file_access", "0") == "1"
+            if os.path.isdir(folder_path):
+                sep = ctk.CTkFrame(self.project_list_frame, height=2, fg_color="#3a3a3c")
+                sep.pack(fill="x", padx=8, pady=8)
+
+                file_title = ctk.CTkLabel(
+                    self.project_list_frame,
+                    text="專案檔案",
+                    font=self.ui_font("sidebar_title", "bold"),
+                )
+                file_title.pack(anchor="w", padx=12, pady=(0, 6))
+
+                if not allow_file_access:
+                    lock_label = ctk.CTkLabel(
+                        self.project_list_frame,
+                        text="🔒 檔案存取已關閉，請至系統環境設定開啟",
+                        text_color="#e8a000",
+                        font=self.ui_font("sidebar_body"),
+                        wraplength=240,
+                        justify="left",
+                    )
+                    lock_label.pack(anchor="w", padx=14, pady=(0, 8))
+                else:
+                    categories = self._scan_project_files(folder_path)
+                    for cat, files in categories.items():
+                        cat_label = ctk.CTkLabel(
+                            self.project_list_frame,
+                            text=f"▸ {cat} ({len(files)})",
+                            text_color="#a0c4e8",
+                            font=self.ui_font("sidebar_body"),
+                        )
+                        cat_label.pack(anchor="w", padx=16, pady=(4, 0))
+
+                        for fname in files:
+                            file_item = ctk.CTkLabel(
+                                self.project_list_frame,
+                                text=f"  {fname}",
+                                text_color="#c8c8c8",
+                                font=ctk.CTkFont(size=11),
+                                anchor="w",
+                                justify="left",
+                                wraplength=240,
+                            )
+                            file_item.pack(anchor="w", padx=24)
+
     def add_project_folder_from_dialog(self):
         import tkinter.filedialog
 
@@ -376,9 +497,10 @@ class AIPlatformApp(ctk.CTk):
     def get_provider_defaults(self, provider_type):
         defaults = {
             "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
-            "Google Gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.0-flash"),
+            "Google Gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash"),
             "Anthropic": ("https://api.anthropic.com", "claude-sonnet-4-20250514"),
             "Ollama": ("http://localhost:11434", "llama3.2"),
+            "LM Studio": ("http://localhost:1234/v1", ""),
             "Azure OpenAI": ("https://your-resource.openai.azure.com", "gpt-4o-mini"),
             "Custom": ("", ""),
         }
@@ -1437,6 +1559,45 @@ class AIPlatformApp(ctk.CTk):
             message_rows = get_messages(self.current_conversation[0])
             messages = [{"role": row[2], "content": row[3]} for row in message_rows]
             messages[-1]["content"] = user_content
+            allow_file_access = get_setting("allow_file_access", "0") == "1"
+            if self.current_project and allow_file_access:
+                project_path = self.current_project[3]
+                messages.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": (
+                            f"你有一個專案資料夾可供讀寫檔案：{project_path}\n"
+                            "使用者已授權你讀寫該資料夾中的檔案。"
+                            "當使用者要求建立、讀取、修改或刪除檔案時，請以該資料夾為工作目錄。"
+                            "回覆時可明確告知檔案的完整路徑。"
+                        ),
+                    },
+                )
+            elif self.current_project and not allow_file_access:
+                project_path = self.current_project[3]
+                messages.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": (
+                            f"你有一個專案資料夾：{project_path}\n"
+                            "但目前檔案存取權限為關閉狀態，你無法讀寫該資料夾中的任何檔案。"
+                            "如果使用者要求你操作檔案，請告知對方需先在「系統環境設定」中開啟「允許模型讀寫本機檔案」。"
+                        ),
+                    },
+                )
+
+            skill_context = build_skill_context(message_text)
+            if skill_context:
+                messages.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": skill_context,
+                    },
+                )
+
             knowledge_context, knowledge_matches = build_knowledge_context(message_text)
             if knowledge_context:
                 messages.insert(
@@ -1451,13 +1612,16 @@ class AIPlatformApp(ctk.CTk):
                     },
                 )
 
-            response = call_provider(
-                provider[2],
-                provider[4],
-                provider[3],
-                provider[5],
-                messages,
-            )
+            if allow_file_access:
+                response = call_provider_with_tools(
+                    provider[2], provider[4], provider[3], provider[5],
+                    messages, TOOLS_SCHEMA,
+                )
+            else:
+                response = call_provider(
+                    provider[2], provider[4], provider[3], provider[5],
+                    messages,
+                )
             self.after(0, self._handle_api_response, response, provider, knowledge_matches)
         except Exception as exc:
             self.after(0, self._render_api_error, str(exc), provider)
@@ -1568,7 +1732,7 @@ class AIPlatformApp(ctk.CTk):
         ctk.CTkLabel(provider_frame, text="類型:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
         self.prov_type = ctk.CTkComboBox(
             provider_frame,
-            values=["OpenAI", "Google Gemini", "Anthropic", "Ollama", "Azure OpenAI", "Custom"],
+            values=["OpenAI", "Google Gemini", "Anthropic", "Ollama", "LM Studio", "Azure OpenAI", "Custom"],
             command=self.on_prov_type_changed,
             width=180,
         )
@@ -1625,13 +1789,18 @@ class AIPlatformApp(ctk.CTk):
         self.model_result.pack(padx=10, pady=10, fill="both", expand=True)
 
         tab_system = notebook.add("系統環境設定")
+        tab_system.grid_rowconfigure(0, weight=1)
+        tab_system.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(tab_system, text="預設模型:", font=self.ui_font("control")).pack(padx=10, pady=10, anchor="w")
-        self.sys_model = ctk.CTkEntry(tab_system, width=260, font=self.ui_font("control"))
+        tab_system_scroll = ctk.CTkScrollableFrame(tab_system, corner_radius=0)
+        tab_system_scroll.grid(row=0, column=0, sticky="nsew")
+
+        ctk.CTkLabel(tab_system_scroll, text="預設模型:", font=self.ui_font("control")).pack(padx=10, pady=10, anchor="w")
+        self.sys_model = ctk.CTkEntry(tab_system_scroll, width=260, font=self.ui_font("control"))
         self.sys_model.pack(padx=10, pady=5, anchor="w")
         self.sys_model.insert(0, get_setting("default_model", ""))
 
-        font_frame = ctk.CTkFrame(tab_system)
+        font_frame = ctk.CTkFrame(tab_system_scroll)
         font_frame.pack(padx=10, pady=(16, 10), fill="x")
 
         ctk.CTkLabel(
@@ -1661,7 +1830,7 @@ class AIPlatformApp(ctk.CTk):
                 sticky="w",
             )
 
-        chat_frame = ctk.CTkFrame(tab_system)
+        chat_frame = ctk.CTkFrame(tab_system_scroll)
         chat_frame.pack(padx=10, pady=(8, 10), fill="x")
 
         ctk.CTkLabel(
@@ -1703,11 +1872,43 @@ class AIPlatformApp(ctk.CTk):
         )
         self.chat_theme_combo.grid(row=2, column=1, padx=10, pady=5, sticky="w")
 
-        self.font_settings_status = ctk.CTkLabel(tab_system, text="", font=self.ui_font("control"))
+        self.font_settings_status = ctk.CTkLabel(tab_system_scroll, text="", font=self.ui_font("control"))
         self.font_settings_status.pack(padx=10, pady=(0, 6), anchor="w")
 
+        perm_frame = ctk.CTkFrame(tab_system_scroll)
+        perm_frame.pack(padx=10, pady=(8, 10), fill="x")
+
+        ctk.CTkLabel(
+            perm_frame,
+            text="檔案存取權限",
+            font=self.ui_font("control", "bold"),
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        self.allow_file_access_var = ctk.BooleanVar(
+            value=get_setting("allow_file_access", "0") == "1"
+        )
+        self.allow_file_access_toggle = ctk.CTkSwitch(
+            perm_frame,
+            text="允許模型讀寫本機檔案",
+            variable=self.allow_file_access_var,
+            onvalue=True,
+            offvalue=False,
+            font=self.ui_font("control"),
+        )
+        self.allow_file_access_toggle.pack(anchor="w", padx=14, pady=(0, 4))
+
+        self.allow_file_access_note = ctk.CTkLabel(
+            perm_frame,
+            text="開啟後，AI 模型可讀取專案資料夾中的檔案內容，並在資料夾內建立或修改檔案。",
+            text_color="#a8a8a8",
+            font=self.ui_font("control"),
+            wraplength=420,
+            justify="left",
+        )
+        self.allow_file_access_note.pack(anchor="w", padx=14, pady=(0, 10))
+
         btn_save_sys = ctk.CTkButton(
-            tab_system,
+            tab_system_scroll,
             text="儲存系統環境設定",
             font=self.ui_font("control"),
             command=self.save_system_settings,
@@ -1857,6 +2058,10 @@ class AIPlatformApp(ctk.CTk):
 
     def save_system_settings(self):
         save_setting("default_model", self.sys_model.get().strip())
+        save_setting(
+            "allow_file_access",
+            "1" if self.allow_file_access_var.get() else "0",
+        )
         new_sizes = {}
         for key, default_size in UI_FONT_DEFAULTS.items():
             value_var = self.font_size_vars.get(key)
@@ -2130,6 +2335,10 @@ class AIPlatformApp(ctk.CTk):
             "• Code Interpreter - 執行 Python 程式碼",
             "• Web Search - 搜尋網路",
             "• Knowledge Retrieval - 從知識庫擷取資訊",
+            "• Office (PPTX) - 建立與編輯 PowerPoint 簡報",
+            "• Office (DOCX) - 建立與編輯 Word 文件",
+            "• Office (PDF) - 處理 PDF 檔案與表單",
+            "• Office (XLSX) - 建立與編輯 Excel 試算表",
         ]
         for skill_text in skills:
             ctk.CTkLabel(info_frame, text=skill_text, font=self.ui_font("control")).pack(anchor="w", padx=20)

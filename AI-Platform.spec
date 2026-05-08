@@ -11,6 +11,7 @@ a = Analysis(
         'data.db',
         'api_calls',
         'knowledge',
+        'skills',
         'keyring',
         'keyring.backends',
         'keyring.backends.Windows',
