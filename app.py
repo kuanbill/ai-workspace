@@ -1,29 +1,39 @@
+import base64
+import io
 import json
-import hashlib
-import math
 import os
 import re
 import shutil
 import sqlite3
+import threading
 from datetime import datetime
+from tkinter import filedialog
 
 import customtkinter as ctk
-import requests
+from PIL import Image
+
+import customtkinter as ctk
+
+from api_calls import call_provider, fetch_models_for_provider, provider_requires_api_key, verify_provider_config
+from config import (
+    get_chat_bubble_width, get_chat_color_theme, get_ui_font_sizes,
+    save_chat_bubble_width, save_chat_color_theme, save_ui_font_sizes,
+)
+from data.db import (
+    DB_PATH, KB_DIR, KB_SOURCE_DIR,
+    add_project_folder, add_user, create_conversation, delete_conversation,
+    delete_knowledge_doc, delete_provider, get_active_provider, get_conversations,
+    get_knowledge_docs, get_messages, get_projects, get_provider_by_name,
+    get_provider_by_id, get_providers, get_setting, get_users, init_db, save_knowledge_doc,
+    save_message, save_provider_record, save_setting, set_active_provider,
+)
+from knowledge import (
+    backup_knowledge, build_knowledge_context, get_local_vector_stats,
+    read_text_file, restore_knowledge, vectorize_knowledge_doc,
+)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-KB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_base")
-KB_SOURCE_DIR = os.path.join(KB_DIR, "sources")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(KB_DIR, exist_ok=True)
-os.makedirs(KB_SOURCE_DIR, exist_ok=True)
-
-DB_PATH = os.path.join(DATA_DIR, "platform.db")
-LOCAL_VECTOR_PATH = os.path.join(KB_DIR, "local_vectors.jsonl")
-AZURE_OPENAI_API_VERSION = "2024-10-21"
-LOCAL_VECTOR_DIMENSIONS = 384
 
 UI_FONT_DEFAULTS = {
     "app_title": 20,
@@ -75,778 +85,6 @@ CHAT_THEME_STYLES = {
     },
 }
 
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS api_providers
-           (id INTEGER PRIMARY KEY,
-            name TEXT,
-            api_type TEXT,
-            base_url TEXT,
-            api_key TEXT,
-            model TEXT,
-            enabled INTEGER DEFAULT 1)"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS users
-           (id INTEGER PRIMARY KEY,
-            username TEXT UNIQUE,
-            email TEXT,
-            created_at TEXT)"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS conversations
-           (id INTEGER PRIMARY KEY,
-            user_id INTEGER,
-            title TEXT,
-            created_at TEXT)"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS messages
-           (id INTEGER PRIMARY KEY,
-            conversation_id INTEGER,
-            role TEXT,
-            content TEXT,
-            created_at TEXT)"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS knowledge_docs
-           (id INTEGER PRIMARY KEY,
-            filename TEXT,
-            content TEXT,
-            uploaded_at TEXT)"""
-    )
-    c.execute("PRAGMA table_info(knowledge_docs)")
-    existing_knowledge_columns = {row[1] for row in c.fetchall()}
-    knowledge_columns = {
-        "source_path": "TEXT",
-        "chunk_count": "INTEGER DEFAULT 0",
-        "vector_status": "TEXT DEFAULT 'pending'",
-        "vectorized_at": "TEXT",
-    }
-    for column_name, column_type in knowledge_columns.items():
-        if column_name not in existing_knowledge_columns:
-            c.execute(f"ALTER TABLE knowledge_docs ADD COLUMN {column_name} {column_type}")
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS settings
-           (key TEXT PRIMARY KEY,
-            value TEXT)"""
-    )
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS user_projects
-           (id INTEGER PRIMARY KEY,
-            user_id INTEGER,
-            name TEXT,
-            folder_path TEXT,
-            created_at TEXT,
-            UNIQUE(user_id, folder_path))"""
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_setting(key, default=""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-
-def save_setting(key, value):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
-
-
-def get_providers():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM api_providers ORDER BY enabled DESC, id DESC")
-    providers = c.fetchall()
-    conn.close()
-    return providers
-
-
-def get_provider_by_id(provider_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM api_providers WHERE id = ?", (provider_id,))
-    provider = c.fetchone()
-    conn.close()
-    return provider
-
-
-def get_provider_by_name(name):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM api_providers WHERE name = ?", (name,))
-    provider = c.fetchone()
-    conn.close()
-    return provider
-
-
-def get_active_provider():
-    active_provider_id = get_setting("active_provider_id", "").strip()
-    if active_provider_id.isdigit():
-        provider = get_provider_by_id(int(active_provider_id))
-        if provider:
-            return provider
-
-    providers = get_providers()
-    if providers:
-        return providers[0]
-    return None
-
-
-def set_active_provider(provider_id):
-    save_setting("active_provider_id", str(provider_id))
-
-
-def save_provider_record(name, api_type, base_url, api_key, model):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id FROM api_providers WHERE name = ?", (name,))
-    existing = c.fetchone()
-
-    if existing:
-        provider_id = existing[0]
-        c.execute(
-            """UPDATE api_providers
-               SET api_type = ?, base_url = ?, api_key = ?, model = ?, enabled = 1
-               WHERE id = ?""",
-            (api_type, base_url, api_key, model, provider_id),
-        )
-    else:
-        c.execute(
-            """INSERT INTO api_providers (name, api_type, base_url, api_key, model, enabled)
-               VALUES (?, ?, ?, ?, ?, 1)""",
-            (name, api_type, base_url, api_key, model),
-        )
-        provider_id = c.lastrowid
-
-    conn.commit()
-    conn.close()
-    set_active_provider(provider_id)
-    return provider_id
-
-
-def delete_provider(provider_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM api_providers WHERE id = ?", (provider_id,))
-    conn.commit()
-    conn.close()
-
-    active_provider = get_setting("active_provider_id", "")
-    if active_provider == str(provider_id):
-        providers = get_providers()
-        if providers:
-            set_active_provider(providers[0][0])
-        else:
-            save_setting("active_provider_id", "")
-
-
-def get_users():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users")
-    users = c.fetchall()
-    conn.close()
-    return users
-
-
-def add_user(username, email):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO users (username, email, created_at) VALUES (?, ?, ?)",
-        (username, email, datetime.now().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def delete_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    c.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
-    c.execute("DELETE FROM user_projects WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_projects(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM user_projects WHERE user_id = ? ORDER BY created_at DESC",
-        (user_id,),
-    )
-    projects = c.fetchall()
-    conn.close()
-    return projects
-
-
-def add_project_folder(user_id, folder_path):
-    normalized_path = os.path.normpath(folder_path)
-    project_name = os.path.basename(normalized_path.rstrip("\\/")) or normalized_path
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO user_projects (user_id, name, folder_path, created_at)
-           VALUES (?, ?, ?, ?)""",
-        (user_id, project_name, normalized_path, datetime.now().isoformat()),
-    )
-    project_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return project_id
-
-
-def get_conversations(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM conversations WHERE user_id = ? ORDER BY created_at DESC",
-        (user_id,),
-    )
-    convs = c.fetchall()
-    conn.close()
-    return convs
-
-
-def create_conversation(user_id, title):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO conversations (user_id, title, created_at) VALUES (?, ?, ?)",
-        (user_id, title, datetime.now().isoformat()),
-    )
-    conv_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return conv_id
-
-
-def delete_conversation(conv_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-    c.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-    conn.commit()
-    conn.close()
-
-
-def save_message(conversation_id, role, content):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        (conversation_id, role, content, datetime.now().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_messages(conversation_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at",
-        (conversation_id,),
-    )
-    msgs = c.fetchall()
-    conn.close()
-    return msgs
-
-
-def get_knowledge_docs():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM knowledge_docs ORDER BY uploaded_at DESC")
-    docs = c.fetchall()
-    conn.close()
-    return docs
-
-
-def save_knowledge_doc(filename, content, source_path=""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO knowledge_docs
-           (filename, content, uploaded_at, source_path, chunk_count, vector_status)
-           VALUES (?, ?, ?, ?, 0, 'pending')""",
-        (filename, content, datetime.now().isoformat(), source_path),
-    )
-    doc_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return doc_id
-
-
-def update_knowledge_vector_status(doc_id, chunk_count, status):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """UPDATE knowledge_docs
-           SET chunk_count = ?, vector_status = ?, vectorized_at = ?
-           WHERE id = ?""",
-        (chunk_count, status, datetime.now().isoformat(), doc_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def delete_knowledge_doc(doc_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM knowledge_docs WHERE id = ?", (doc_id,))
-    conn.commit()
-    conn.close()
-
-
-def read_text_file(file_path):
-    for encoding in ("utf-8-sig", "utf-8", "cp950", "big5"):
-        try:
-            with open(file_path, "r", encoding=encoding) as file_handle:
-                return file_handle.read()
-        except UnicodeDecodeError:
-            continue
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as file_handle:
-        return file_handle.read()
-
-
-def split_text_chunks(text, max_chars=900, overlap=150):
-    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
-    chunks = []
-    current = ""
-
-    for paragraph in paragraphs:
-        if len(paragraph) > max_chars:
-            if current:
-                chunks.append(current.strip())
-                current = ""
-            start = 0
-            while start < len(paragraph):
-                chunk = paragraph[start : start + max_chars].strip()
-                if chunk:
-                    chunks.append(chunk)
-                start += max_chars - overlap
-            continue
-
-        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current.strip())
-            current = paragraph
-
-    if current:
-        chunks.append(current.strip())
-    return chunks
-
-
-def tokenize_for_vector(text):
-    lowered = text.lower()
-    tokens = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]", lowered)
-    return tokens
-
-
-def embed_text_sparse(text):
-    vector = {}
-    for token in tokenize_for_vector(text):
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % LOCAL_VECTOR_DIMENSIONS
-        sign = 1 if digest[4] % 2 == 0 else -1
-        vector[index] = vector.get(index, 0.0) + sign
-
-    norm = math.sqrt(sum(value * value for value in vector.values()))
-    if not norm:
-        return {}
-    return {str(index): round(value / norm, 6) for index, value in vector.items() if value}
-
-
-def sparse_cosine_similarity(left, right):
-    if not left or not right:
-        return 0.0
-    if len(left) > len(right):
-        left, right = right, left
-    return sum(value * right.get(index, 0.0) for index, value in left.items())
-
-
-def append_local_vectors(doc_id, filename, chunks):
-    if not chunks:
-        return 0
-
-    with open(LOCAL_VECTOR_PATH, "a", encoding="utf-8") as file_handle:
-        for index, chunk in enumerate(chunks):
-            record = {
-                "doc_id": doc_id,
-                "filename": filename,
-                "chunk_index": index,
-                "text": chunk,
-                "embedding": embed_text_sparse(chunk),
-                "created_at": datetime.now().isoformat(),
-            }
-            file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    return len(chunks)
-
-
-def vectorize_knowledge_doc(doc_id, filename, content):
-    chunks = split_text_chunks(content)
-    chunk_count = append_local_vectors(doc_id, filename, chunks)
-    update_knowledge_vector_status(doc_id, chunk_count, "ready" if chunk_count else "empty")
-    return chunk_count
-
-
-def search_local_knowledge(query, limit=5):
-    if not os.path.exists(LOCAL_VECTOR_PATH):
-        return []
-
-    query_vector = {int(index): value for index, value in embed_text_sparse(query).items()}
-    if not query_vector:
-        return []
-
-    matches = []
-    with open(LOCAL_VECTOR_PATH, "r", encoding="utf-8") as file_handle:
-        for line in file_handle:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            vector = {int(index): value for index, value in record.get("embedding", {}).items()}
-            score = sparse_cosine_similarity(query_vector, vector)
-            if score > 0:
-                matches.append((score, record))
-
-    matches.sort(key=lambda item: item[0], reverse=True)
-    return [
-        {
-            "score": score,
-            "filename": record.get("filename", ""),
-            "text": record.get("text", ""),
-            "chunk_index": record.get("chunk_index", 0),
-        }
-        for score, record in matches[:limit]
-    ]
-
-
-def build_knowledge_context(query, limit=5):
-    matches = search_local_knowledge(query, limit=limit)
-    if not matches:
-        return "", []
-
-    sections = []
-    for index, match in enumerate(matches, start=1):
-        sections.append(
-            f"[知識片段 {index}] 來源: {match['filename']} / chunk {match['chunk_index']} / score {match['score']:.3f}\n"
-            f"{match['text']}"
-        )
-    return "\n\n".join(sections), matches
-
-
-def get_local_vector_stats():
-    if not os.path.exists(LOCAL_VECTOR_PATH):
-        return 0
-    count = 0
-    with open(LOCAL_VECTOR_PATH, "r", encoding="utf-8") as file_handle:
-        for _line in file_handle:
-            count += 1
-    return count
-
-
-def normalize_base_url(base_url):
-    return base_url.strip().rstrip("/")
-
-
-def provider_requires_api_key(api_type):
-    return api_type not in ("Ollama",)
-
-
-def format_error(prefix, response):
-    try:
-        details = response.json()
-    except Exception:
-        details = response.text
-    return f"{prefix}: {response.status_code} - {str(details)[:250]}"
-
-
-def convert_messages_for_anthropic(messages):
-    anthropic_messages = []
-    system_notes = []
-
-    for message in messages:
-        role = message["role"]
-        content = message["content"]
-
-        if role == "system":
-            system_notes.append(content)
-            continue
-
-        mapped_role = "assistant" if role == "assistant" else "user"
-        anthropic_messages.append({"role": mapped_role, "content": content})
-
-    if system_notes:
-        system_text = "\n".join(system_notes)
-        if anthropic_messages and anthropic_messages[0]["role"] == "user":
-            anthropic_messages[0]["content"] = f"{system_text}\n\n{anthropic_messages[0]['content']}"
-        else:
-            anthropic_messages.insert(0, {"role": "user", "content": system_text})
-
-    if not anthropic_messages:
-        anthropic_messages.append({"role": "user", "content": "Hi"})
-
-    return anthropic_messages
-
-
-def convert_messages_for_google(messages):
-    contents = []
-    system_notes = []
-
-    for message in messages:
-        role = message["role"]
-        content = message["content"]
-
-        if role == "system":
-            system_notes.append(content)
-            continue
-
-        mapped_role = "model" if role == "assistant" else "user"
-        contents.append({"role": mapped_role, "parts": [{"text": content}]})
-
-    if system_notes:
-        system_text = "\n".join(system_notes)
-        if contents and contents[0]["role"] == "user":
-            first_text = contents[0]["parts"][0]["text"]
-            contents[0]["parts"][0]["text"] = f"{system_text}\n\n{first_text}"
-        else:
-            contents.insert(0, {"role": "user", "parts": [{"text": system_text}]})
-
-    if not contents:
-        contents.append({"role": "user", "parts": [{"text": "Hi"}]})
-
-    return contents
-
-
-def call_openai(api_key, base_url, model, messages):
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    data = {"model": model, "messages": messages, "max_tokens": 2000}
-
-    try:
-        response = requests.post(
-            f"{normalize_base_url(base_url)}/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=60,
-        )
-        if response.status_code == 200:
-            payload = response.json()
-            return payload["choices"][0]["message"]["content"]
-        return format_error("API 錯誤", response)
-    except Exception as exc:
-        return f"連線錯誤: {str(exc)}"
-
-
-def call_azure_openai(api_key, base_url, deployment_name, messages):
-    headers = {"api-key": api_key, "Content-Type": "application/json"}
-    data = {"messages": messages, "max_tokens": 2000}
-
-    try:
-        response = requests.post(
-            f"{normalize_base_url(base_url)}/openai/deployments/{deployment_name}/chat/completions",
-            headers=headers,
-            params={"api-version": AZURE_OPENAI_API_VERSION},
-            json=data,
-            timeout=60,
-        )
-        if response.status_code == 200:
-            payload = response.json()
-            return payload["choices"][0]["message"]["content"]
-        return format_error("API 錯誤", response)
-    except Exception as exc:
-        return f"連線錯誤: {str(exc)}"
-
-
-def call_anthropic(api_key, model, messages):
-    headers = {
-        "x-api-key": api_key,
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-    }
-    data = {
-        "model": model,
-        "max_tokens": 2000,
-        "messages": convert_messages_for_anthropic(messages),
-    }
-
-    try:
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=data,
-            timeout=60,
-        )
-        if response.status_code == 200:
-            payload = response.json()
-            text_parts = [item.get("text", "") for item in payload.get("content", []) if item.get("type") == "text"]
-            return "\n".join(part for part in text_parts if part).strip()
-        return format_error("API 錯誤", response)
-    except Exception as exc:
-        return f"連線錯誤: {str(exc)}"
-
-
-def call_ollama(base_url, model, messages):
-    data = {"model": model, "messages": messages, "stream": False}
-
-    try:
-        response = requests.post(
-            f"{normalize_base_url(base_url)}/api/chat",
-            json=data,
-            timeout=120,
-        )
-        if response.status_code == 200:
-            return response.json()["message"]["content"]
-        return format_error("API 錯誤", response)
-    except Exception as exc:
-        return f"連線錯誤: {str(exc)}"
-
-
-def call_google(api_key, base_url, model, messages):
-    data = {
-        "contents": convert_messages_for_google(messages),
-        "generationConfig": {"maxOutputTokens": 2000},
-    }
-
-    try:
-        response = requests.post(
-            f"{normalize_base_url(base_url)}/models/{model}:generateContent",
-            params={"key": api_key},
-            headers={"Content-Type": "application/json"},
-            json=data,
-            timeout=60,
-        )
-        payload = response.json()
-        if response.status_code == 200:
-            candidates = payload.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                return "\n".join(part.get("text", "") for part in parts if part.get("text")).strip()
-            return "回應格式錯誤: 缺少 candidates"
-        return f"API 錯誤: {response.status_code} - {str(payload)[:250]}"
-    except Exception as exc:
-        return f"連線錯誤: {str(exc)}"
-
-
-def call_provider(api_type, api_key, base_url, model, messages):
-    if api_type in ("OpenAI", "Custom"):
-        return call_openai(api_key, base_url, model, messages)
-    if api_type == "Azure OpenAI":
-        return call_azure_openai(api_key, base_url, model, messages)
-    if api_type == "Anthropic":
-        return call_anthropic(api_key, model, messages)
-    if api_type == "Ollama":
-        return call_ollama(base_url, model, messages)
-    if api_type == "Google Gemini":
-        return call_google(api_key, base_url, model, messages)
-    return f"不支援的供應商類型: {api_type}"
-
-
-def verify_provider_config(api_type, api_key, base_url, model):
-    if provider_requires_api_key(api_type) and not api_key:
-        return False, "請輸入 API Key"
-    if not base_url and api_type not in ("Anthropic",):
-        return False, "請輸入 Base URL"
-    if not model:
-        return False, "請先指定模型"
-
-    test_messages = [{"role": "user", "content": "Reply with OK only."}]
-    result = call_provider(api_type, api_key, base_url, model, test_messages)
-    if not result or "API 錯誤" in result or "連線錯誤" in result or "回應格式錯誤" in result:
-        return False, result
-    return True, f"驗證成功，模型可用: {model}"
-
-
-def fetch_models_for_provider(api_type, api_key, base_url):
-    if provider_requires_api_key(api_type) and not api_key:
-        return False, "請先輸入 API Key", []
-    if not base_url and api_type not in ("Anthropic",):
-        return False, "請先輸入 Base URL", []
-
-    try:
-        if api_type in ("OpenAI", "Custom"):
-            response = requests.get(
-                f"{normalize_base_url(base_url)}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=30,
-            )
-            if response.status_code != 200:
-                return False, format_error("查詢失敗", response), []
-            models = sorted(model["id"] for model in response.json().get("data", []))
-            return True, f"找到 {len(models)} 個模型", models
-
-        if api_type == "Azure OpenAI":
-            response = requests.get(
-                f"{normalize_base_url(base_url)}/openai/models",
-                headers={"api-key": api_key},
-                params={"api-version": AZURE_OPENAI_API_VERSION},
-                timeout=30,
-            )
-            if response.status_code != 200:
-                return False, format_error("查詢失敗", response), []
-            models = sorted(model["id"] for model in response.json().get("data", []))
-            note = "找到可用模型。Azure 對話時通常仍需填入部署名稱。"
-            return True, note, models
-
-        if api_type == "Anthropic":
-            response = requests.get(
-                "https://api.anthropic.com/v1/models",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
-                timeout=30,
-            )
-            if response.status_code != 200:
-                return False, format_error("查詢失敗", response), []
-            models = sorted(model["id"] for model in response.json().get("data", []))
-            return True, f"找到 {len(models)} 個模型", models
-
-        if api_type == "Ollama":
-            response = requests.get(f"{normalize_base_url(base_url)}/api/tags", timeout=30)
-            if response.status_code != 200:
-                return False, format_error("查詢失敗", response), []
-            models = sorted({model.get("name") or model.get("model") for model in response.json().get("models", []) if model.get("name") or model.get("model")})
-            return True, f"找到 {len(models)} 個本機模型", models
-
-        if api_type == "Google Gemini":
-            response = requests.get(
-                f"{normalize_base_url(base_url)}/models",
-                params={"key": api_key},
-                timeout=30,
-            )
-            if response.status_code != 200:
-                return False, format_error("查詢失敗", response), []
-            models = []
-            for model in response.json().get("models", []):
-                methods = model.get("supportedGenerationMethods", [])
-                if "generateContent" in methods:
-                    model_name = model.get("name", "").replace("models/", "")
-                    if model_name:
-                        models.append(model_name)
-            models = sorted(set(models))
-            return True, f"找到 {len(models)} 個 Gemini 模型", models
-
-        return False, "不支援的供應商類型", []
-    except Exception as exc:
-        return False, f"連線錯誤: {str(exc)}", []
-
-
 init_db()
 
 
@@ -865,34 +103,26 @@ class AIPlatformApp(ctk.CTk):
         self.history_manage_mode = False
         self.current_view = "chat"
         self.font_size_vars = {}
+        self.attachments = []
         self.load_ui_font_sizes()
         self.load_chat_display_settings()
 
         self.setup_ui()
 
     def load_ui_font_sizes(self):
+        stored = get_ui_font_sizes()
         self.ui_font_sizes = {}
         for key, default_size in UI_FONT_DEFAULTS.items():
-            raw_value = get_setting(f"ui_font_{key}", str(default_size))
-            try:
-                size = int(raw_value)
-            except (TypeError, ValueError):
-                size = default_size
-            self.ui_font_sizes[key] = max(9, min(32, size))
+            self.ui_font_sizes[key] = stored.get(key, default_size)
 
     def ui_font(self, key, weight=None):
         size = self.ui_font_sizes.get(key, UI_FONT_DEFAULTS.get(key, 13))
         return ctk.CTkFont(size=size, weight=weight)
 
     def load_chat_display_settings(self):
-        raw_width = get_setting("chat_bubble_width", "860")
-        try:
-            width = int(raw_width)
-        except (TypeError, ValueError):
-            width = 860
-        self.chat_bubble_setting_width = max(520, min(1100, width))
+        self.chat_bubble_setting_width = get_chat_bubble_width(860)
 
-        theme = get_setting("chat_color_theme", "黑灰白")
+        theme = get_chat_color_theme("黑灰白")
         self.chat_color_theme = theme if theme in CHAT_THEME_STYLES else "黑灰白"
 
     def get_chat_theme_styles(self):
@@ -1146,7 +376,7 @@ class AIPlatformApp(ctk.CTk):
     def get_provider_defaults(self, provider_type):
         defaults = {
             "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
-            "Google Gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash"),
+            "Google Gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.0-flash"),
             "Anthropic": ("https://api.anthropic.com", "claude-sonnet-4-20250514"),
             "Ollama": ("http://localhost:11434", "llama3.2"),
             "Azure OpenAI": ("https://your-resource.openai.azure.com", "gpt-4o-mini"),
@@ -1385,7 +615,96 @@ class AIPlatformApp(ctk.CTk):
 
     def clear_input_text(self):
         self.msg_entry.delete("1.0", "end")
+        self.attachments.clear()
+        self.refresh_attach_preview()
         self.autosize_input_box()
+
+    def attach_file(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ("圖片", "*.png *.jpg *.jpeg *.gif *.webp"),
+                ("所有檔案", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+        self.add_attachment(file_path)
+
+    def add_attachment(self, file_path):
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            ext = os.path.splitext(file_path)[1].lower()
+            mime_map = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp",
+            }
+            mime = mime_map.get(ext, "image/png")
+            self.attachments.append({
+                "name": os.path.basename(file_path),
+                "data": data,
+                "mime": mime,
+            })
+            self.refresh_attach_preview()
+        except Exception as exc:
+            self.render_chat_item({
+                "role": "system", "kind": "warning",
+                "content": f"無法讀取檔案: {exc}",
+            })
+
+    def remove_attachment(self, index):
+        if 0 <= index < len(self.attachments):
+            self.attachments.pop(index)
+            self.refresh_attach_preview()
+
+    def refresh_attach_preview(self):
+        for widget in self.attach_frame.winfo_children():
+            widget.destroy()
+        if not self.attachments:
+            self.attach_frame.pack_forget()
+            return
+        self.attach_frame.pack(fill="x", padx=8, pady=(0, 4))
+        for i, att in enumerate(self.attachments):
+            frame = ctk.CTkFrame(self.attach_frame, fg_color="#2a2a2a", corner_radius=8)
+            frame.pack(side="left", padx=4, pady=4)
+            try:
+                img = Image.open(io.BytesIO(att["data"]))
+                img.thumbnail((48, 48))
+                ctk_img = ctk.CTkImage(img, size=img.size)
+                label = ctk.CTkLabel(frame, image=ctk_img, text="")
+                label.pack(side="left", padx=4, pady=4)
+            except Exception:
+                ctk.CTkLabel(frame, text="📄", font=ctk.CTkFont(size=24)).pack(side="left", padx=6, pady=4)
+            name_label = ctk.CTkLabel(
+                frame, text=att["name"][:20], text_color="#cccccc",
+                font=self.ui_font("chat_meta"),
+            )
+            name_label.pack(side="left", padx=2)
+            rm_btn = ctk.CTkButton(
+                frame, text="✕", width=24, height=24,
+                fg_color="#6b2c2c", hover_color="#8a3a3a",
+                command=lambda idx=i: self.remove_attachment(idx),
+            )
+            rm_btn.pack(side="left", padx=4)
+
+    def on_paste(self, event):
+        try:
+            clip_image = self.clipboard_get_image()
+            if clip_image:
+                buf = io.BytesIO()
+                clip_image.save(buf, format="PNG")
+                buf.seek(0)
+                data = buf.read()
+                self.attachments.append({
+                    "name": "clipboard.png",
+                    "data": data,
+                    "mime": "image/png",
+                })
+                self.refresh_attach_preview()
+                return "break"
+        except Exception:
+            pass
+        return None
 
     def estimate_input_line_count(self, text):
         raw_lines = text.splitlines() or [""]
@@ -1453,7 +772,7 @@ class AIPlatformApp(ctk.CTk):
         cleaned = cleaned.replace("\\rightarrow", "->").replace("\\Rightarrow", "=>")
         cleaned = re.sub(r"\$(.*?)\$", r"\1", cleaned)
         cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
-        cleaned = re.sub(r"\*(.*?)\*", r"\1", cleaned)
+        cleaned = re.sub(r"\*([^\s*][^*]*?[^\s*])\*", r"\1", cleaned)
         cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
         return cleaned
 
@@ -1635,6 +954,7 @@ class AIPlatformApp(ctk.CTk):
             "meta": item.get("meta", {}),
             "sections": item.get("sections", []),
             "timestamp": item.get("timestamp", ""),
+            "attachments": item.get("attachments", []),
         }
 
     def build_ai_response_item(self, response, provider, timestamp=""):
@@ -1756,6 +1076,18 @@ class AIPlatformApp(ctk.CTk):
                     wraplength=self.chat_text_wrap,
                 )
                 meta_label.pack(fill="x", padx=14, pady=(0, 4))
+
+        for att in normalized.get("attachments", []):
+            try:
+                img = Image.open(io.BytesIO(att["data"]))
+                max_w = min(400, self.chat_content_width)
+                ratio = max_w / img.width if img.width > max_w else 1.0
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                ctk_img = ctk.CTkImage(img, size=new_size)
+                img_label = ctk.CTkLabel(bubble_frame, image=ctk_img, text="")
+                img_label.pack(fill="x", padx=14, pady=(4, 4))
+            except Exception:
+                pass
 
         content = self.format_display_value(normalized["content"])
         if content:
@@ -1906,6 +1238,10 @@ class AIPlatformApp(ctk.CTk):
         )
         input_hint.pack(fill="x", padx=10, pady=(8, 4))
 
+        self.attach_frame = ctk.CTkFrame(input_frame, fg_color="transparent", height=60)
+        self.attach_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self.attach_frame.pack_forget()
+
         input_row = ctk.CTkFrame(input_frame, fg_color="transparent")
         input_row.pack(fill="x", padx=8, pady=(0, 8))
 
@@ -1918,8 +1254,15 @@ class AIPlatformApp(ctk.CTk):
         self.msg_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.msg_entry.bind("<KeyRelease>", self.autosize_input_box)
         self.msg_entry.bind("<Return>", self.on_input_return)
+        self.msg_entry.bind("<<Paste>>", self.on_paste)
 
-        self.btn_send = ctk.CTkButton(input_row, text="傳送", width=96, command=self.send_message)
+        self.btn_attach = ctk.CTkButton(
+            input_row, text="📎", width=40, command=self.attach_file,
+            font=ctk.CTkFont(size=16),
+        )
+        self.btn_attach.pack(side="right", padx=(0, 4))
+
+        self.btn_send = ctk.CTkButton(input_row, text="傳送", width=80, command=self.send_message)
         self.btn_send.pack(side="right")
         self.autosize_input_box()
 
@@ -2053,13 +1396,47 @@ class AIPlatformApp(ctk.CTk):
             self.render_chat_item({"role": "system", "kind": "error", "content": "無法建立新對話，請重試"})
             return
 
-        self.render_chat_item({"role": "user", "content": message_text})
+        attachments = list(self.attachments)
+        self.render_chat_item({"role": "user", "content": message_text, "attachments": attachments})
         self.clear_input_text()
+        self.render_chat_item(
+            {
+                "role": "assistant",
+                "kind": "status",
+                "title": "處理中",
+                "content": "正在產生回答。",
+                "meta": {"provider": provider[1], "model": provider[5]},
+            }
+        )
+        self.update()
+
+        thread = threading.Thread(
+            target=self._do_api_call,
+            args=(provider, message_text, attachments),
+            daemon=True,
+        )
+        thread.start()
+
+    def _build_multimodal_content(self, text, attachments):
+        if not attachments:
+            return text
+        parts = [{"type": "text", "text": text or "（附件）"}]
+        for att in attachments:
+            b64 = base64.b64encode(att["data"]).decode("utf-8")
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{att['mime']};base64,{b64}"},
+            })
+        return parts
+
+    def _do_api_call(self, provider, message_text, attachments):
         try:
+            user_content = self._build_multimodal_content(message_text, attachments)
             save_message(self.current_conversation[0], "user", message_text)
 
             message_rows = get_messages(self.current_conversation[0])
             messages = [{"role": row[2], "content": row[3]} for row in message_rows]
+            messages[-1]["content"] = user_content
             knowledge_context, knowledge_matches = build_knowledge_context(message_text)
             if knowledge_context:
                 messages.insert(
@@ -2074,21 +1451,6 @@ class AIPlatformApp(ctk.CTk):
                     },
                 )
 
-            self.render_chat_item(
-                {
-                    "role": "assistant",
-                    "kind": "status",
-                    "title": "處理中",
-                    "content": "正在產生回答。",
-                    "meta": {
-                        "provider": provider[1],
-                        "model": provider[5],
-                        "knowledge": f"{len(knowledge_matches)} 個片段" if knowledge_matches else "未命中",
-                    },
-                }
-            )
-            self.update()
-
             response = call_provider(
                 provider[2],
                 provider[4],
@@ -2096,19 +1458,24 @@ class AIPlatformApp(ctk.CTk):
                 provider[5],
                 messages,
             )
-
-            self.render_chat_item(self.build_ai_response_item(response, provider))
-            save_message(self.current_conversation[0], "assistant", response)
+            self.after(0, self._handle_api_response, response, provider, knowledge_matches)
         except Exception as exc:
-            self.render_chat_item(
-                {
-                    "role": "system",
-                    "kind": "error",
-                    "title": "對話處理失敗",
-                    "content": str(exc),
-                    "meta": {"provider": provider[1], "model": provider[5]},
-                }
-            )
+            self.after(0, self._render_api_error, str(exc), provider)
+
+    def _handle_api_response(self, response, provider, knowledge_matches):
+        self.render_chat_item(self.build_ai_response_item(response, provider))
+        save_message(self.current_conversation[0], "assistant", response)
+
+    def _render_api_error(self, error_text, provider):
+        self.render_chat_item(
+            {
+                "role": "system",
+                "kind": "error",
+                "title": "對話處理失敗",
+                "content": error_text,
+                "meta": {"provider": provider[1], "model": provider[5]},
+            }
+        )
 
     def show_users(self):
         self.current_view = "users"
@@ -2499,8 +1866,8 @@ class AIPlatformApp(ctk.CTk):
             except ValueError:
                 size = default_size
             size = max(9, min(32, size))
-            save_setting(f"ui_font_{key}", str(size))
             new_sizes[key] = size
+        save_ui_font_sizes(new_sizes)
 
         raw_chat_width = self.chat_width_var.get().strip() if hasattr(self, "chat_width_var") else str(self.chat_bubble_setting_width)
         try:
@@ -2510,8 +1877,8 @@ class AIPlatformApp(ctk.CTk):
         chat_width = max(520, min(1100, chat_width))
         chat_theme = self.chat_theme_var.get().strip() if hasattr(self, "chat_theme_var") else self.chat_color_theme
         chat_theme = chat_theme if chat_theme in CHAT_THEME_STYLES else "黑灰白"
-        save_setting("chat_bubble_width", str(chat_width))
-        save_setting("chat_color_theme", chat_theme)
+        save_chat_bubble_width(chat_width)
+        save_chat_color_theme(chat_theme)
 
         self.ui_font_sizes = new_sizes
         self.chat_bubble_setting_width = chat_width
@@ -2532,6 +1899,7 @@ class AIPlatformApp(ctk.CTk):
         self.current_view = "knowledge"
         self.clear_main()
         self.set_active_nav("knowledge")
+        self.kb_selected_files = []
 
         title = ctk.CTkLabel(
             self.main_frame,
@@ -2545,22 +1913,54 @@ class AIPlatformApp(ctk.CTk):
 
         ctk.CTkLabel(upload_frame, text="選擇文件:", font=self.ui_font("control")).pack(side="left", padx=5)
 
-        self.kb_file = ctk.CTkButton(upload_frame, text="選擇檔案...", font=self.ui_font("control"), command=self.select_file)
-        self.kb_file.pack(side="left", padx=5)
+        self.kb_file_btn = ctk.CTkButton(
+            upload_frame, text="選擇多個檔案...", font=self.ui_font("control"),
+            command=self.select_kb_files,
+        )
+        self.kb_file_btn.pack(side="left", padx=5)
 
-        self.kb_filename = ctk.CTkLabel(upload_frame, text="", font=self.ui_font("control"))
-        self.kb_filename.pack(side="left", padx=5)
+        self.kb_file_label = ctk.CTkLabel(upload_frame, text="", font=self.ui_font("control"))
+        self.kb_file_label.pack(side="left", padx=5)
 
         self.btn_upload_kb = ctk.CTkButton(
             upload_frame,
-            text="上傳並向量化",
+            text="批次上傳並向量化",
             font=self.ui_font("control"),
-            command=self.upload_knowledge,
+            command=self.batch_upload_knowledge,
         )
         self.btn_upload_kb.pack(side="left", padx=5)
 
         self.kb_status_label = ctk.CTkLabel(upload_frame, text="", font=self.ui_font("control"))
         self.kb_status_label.pack(side="left", padx=10)
+
+        action_frame = ctk.CTkFrame(self.main_frame)
+        action_frame.pack(padx=20, pady=(0, 10), fill="x")
+
+        self.btn_kb_backup = ctk.CTkButton(
+            action_frame, text="備份知識庫", font=self.ui_font("control"),
+            command=self.backup_knowledge_base, width=120,
+        )
+        self.btn_kb_backup.pack(side="left", padx=5)
+
+        self.btn_kb_restore = ctk.CTkButton(
+            action_frame, text="還原知識庫", font=self.ui_font("control"),
+            command=self.restore_knowledge_base, width=120,
+        )
+        self.btn_kb_restore.pack(side="left", padx=5)
+
+        self.btn_kb_delete = ctk.CTkButton(
+            action_frame, text="刪除選取文件", font=self.ui_font("control"),
+            command=self.delete_knowledge_doc_handler, width=120,
+            fg_color="#8b3a3a", hover_color="#a04545",
+        )
+        self.btn_kb_delete.pack(side="left", padx=5)
+
+        self.kb_doc_selector = ctk.CTkComboBox(
+            action_frame, values=[""],
+            font=self.ui_font("control"), width=300,
+            state="readonly",
+        )
+        self.kb_doc_selector.pack(side="left", padx=5)
 
         list_frame = ctk.CTkFrame(self.main_frame)
         list_frame.pack(padx=20, pady=10, fill="both", expand=True)
@@ -2570,39 +1970,113 @@ class AIPlatformApp(ctk.CTk):
 
         self.refresh_knowledge_list()
 
-    def select_file(self):
+    def select_kb_files(self):
         import tkinter.filedialog
 
-        file_path = tkinter.filedialog.askopenfilename(
+        file_paths = tkinter.filedialog.askopenfilenames(
             filetypes=[("文字檔", "*.txt *.md"), ("所有檔案", "*.*")]
         )
-        if file_path:
-            self.kb_filename.configure(text=os.path.basename(file_path))
-            self.selected_file = file_path
-
-    def upload_knowledge(self):
-        if not self.selected_file:
-            return
-
-        try:
-            filename = os.path.basename(self.selected_file)
-            timestamp_prefix = datetime.now().strftime("%Y%m%d%H%M%S")
-            stored_filename = f"{timestamp_prefix}_{filename}"
-            stored_path = os.path.join(KB_SOURCE_DIR, stored_filename)
-            shutil.copy2(self.selected_file, stored_path)
-
-            content = read_text_file(stored_path)
-            doc_id = save_knowledge_doc(filename, content, stored_path)
-            chunk_count = vectorize_knowledge_doc(doc_id, filename, content)
-            self.kb_status_label.configure(
-                text=f"已上傳並建立 {chunk_count} 個向量片段",
-                text_color="lightgreen",
-            )
-            self.refresh_knowledge_list()
-        except Exception as exc:
+        if file_paths:
+            self.kb_selected_files = list(file_paths)
+            names = [os.path.basename(p) for p in self.kb_selected_files]
+            if len(names) <= 3:
+                self.kb_file_label.configure(text=", ".join(names))
+            else:
+                self.kb_file_label.configure(text=f"{len(names)} 個檔案已選取")
             if hasattr(self, "kb_status_label"):
-                self.kb_status_label.configure(text="向量處理失敗", text_color="red")
-            self.kb_list.insert("end", f"錯誤: {exc}\n")
+                self.kb_status_label.configure(text="")
+
+    def batch_upload_knowledge(self):
+        if not self.kb_selected_files:
+            return
+        self.btn_upload_kb.configure(state="disabled", text="處理中...")
+        self.kb_status_label.configure(text="")
+
+        def process():
+            total_ok = 0
+            total_err = 0
+            for i, file_path in enumerate(self.kb_selected_files):
+                try:
+                    filename = os.path.basename(file_path)
+                    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+                    stored_name = f"{ts}_{filename}"
+                    stored_path = os.path.join(KB_SOURCE_DIR, stored_name)
+                    shutil.copy2(file_path, stored_path)
+                    content = read_text_file(stored_path)
+                    doc_id = save_knowledge_doc(filename, content, stored_path)
+                    chunk_count = vectorize_knowledge_doc(doc_id, filename, content)
+                    total_ok += 1
+                    msg = f"({i+1}/{len(self.kb_selected_files)}) {filename} → {chunk_count} chunks"
+                    self.after(0, self.kb_status_label.configure, {"text": msg, "text_color": "lightgreen"})
+                except Exception as exc:
+                    total_err += 1
+                    self.after(
+                        0, self.kb_list.insert, "end",
+                        f"錯誤: {os.path.basename(file_path)} → {exc}\n",
+                    )
+            self.after(0, self.batch_upload_done, total_ok, total_err)
+
+        threading.Thread(target=process, daemon=True).start()
+
+    def batch_upload_done(self, total_ok, total_err):
+        self.btn_upload_kb.configure(state="normal", text="批次上傳並向量化")
+        self.kb_selected_files = []
+        self.kb_file_label.configure(text="")
+        status = f"完成: {total_ok} 個成功"
+        if total_err:
+            status += f", {total_err} 個失敗"
+        self.kb_status_label.configure(text=status, text_color="lightgreen" if not total_err else "orange")
+        self.refresh_knowledge_list()
+
+    def backup_knowledge_base(self):
+        import tkinter.filedialog
+        path = tkinter.filedialog.asksaveasfilename(
+            defaultextension=".zip",
+            filetypes=[("Zip 檔案", "*.zip")],
+            title="備份知識庫",
+        )
+        if not path:
+            return
+        try:
+            result = backup_knowledge(path)
+            self.kb_status_label.configure(text=f"備份完成: {result}", text_color="lightgreen")
+        except Exception as exc:
+            self.kb_status_label.configure(text=f"備份失敗: {exc}", text_color="red")
+
+    def restore_knowledge_base(self):
+        import tkinter.filedialog
+        path = tkinter.filedialog.askopenfilename(
+            filetypes=[("Zip 檔案", "*.zip")],
+            title="還原知識庫",
+        )
+        if not path:
+            return
+        import tkinter.messagebox
+        confirm = tkinter.messagebox.askyesno(
+            "確認還原",
+            "還原將會覆蓋現有的向量資料與來源檔案。\n建議先備份目前的知識庫。\n確定要繼續嗎？",
+        )
+        if not confirm:
+            return
+        success, msg = restore_knowledge(path)
+        self.kb_status_label.configure(text=msg, text_color="lightgreen" if success else "red")
+        if success:
+            self.refresh_knowledge_list()
+
+    def delete_knowledge_doc_handler(self):
+        selected = self.kb_doc_selector.get() if hasattr(self, "kb_doc_selector") else ""
+        if not selected:
+            return
+        doc_id_str = selected.split(" (id:")[-1].rstrip(")") if " (id:" in selected else ""
+        if not doc_id_str.isdigit():
+            return
+        doc_id = int(doc_id_str)
+        import tkinter.messagebox
+        if not tkinter.messagebox.askyesno("確認刪除", f"確定要刪除「{selected}」及其向量資料？"):
+            return
+        delete_knowledge_doc(doc_id)
+        self.kb_status_label.configure(text=f"已刪除: {selected}", text_color="orange")
+        self.refresh_knowledge_list()
 
     def refresh_knowledge_list(self):
         self.kb_list.delete("1.0", "end")
@@ -2611,13 +2085,20 @@ class AIPlatformApp(ctk.CTk):
         if os.path.exists(chroma_path):
             self.kb_list.insert("end", "偵測到既有 Chroma 向量庫: knowledge_base/chroma.sqlite3\n")
         self.kb_list.insert("end", "\n")
-        for document in get_knowledge_docs():
+        docs = get_knowledge_docs()
+        doc_names = []
+        for document in docs:
             chunk_count = document[5] if len(document) > 5 and document[5] is not None else 0
             vector_status = document[6] if len(document) > 6 and document[6] else "unknown"
+            label = f"{document[1]} (id:{document[0]}) - {vector_status}/{chunk_count}"
+            doc_names.append(label)
             self.kb_list.insert(
                 "end",
                 f"• {document[1]} - 上傳於 {document[3]} - 向量狀態: {vector_status} / {chunk_count} chunks\n",
             )
+        if hasattr(self, "kb_doc_selector"):
+            self.kb_doc_selector.configure(values=[""] + doc_names)
+            self.kb_doc_selector.set("")
 
     def show_tools(self):
         self.current_view = "tools"
@@ -2667,8 +2148,20 @@ class AIPlatformApp(ctk.CTk):
         self.sql_result = ctk.CTkTextbox(self.main_frame, height=220, font=self.ui_font("control"))
         self.sql_result.pack(padx=20, pady=10, fill="both", expand=True)
 
+    def _is_read_only_query(self, query: str) -> bool:
+        stripped = query.strip().upper()
+        if not stripped:
+            return False
+        if ";" in stripped.rstrip(";"):
+            return False
+        return stripped.startswith("SELECT") or stripped.startswith("PRAGMA") or stripped.startswith("EXPLAIN")
+
     def test_sql(self):
         query = self.sql_test.get().strip()
+        if not self._is_read_only_query(query):
+            self.sql_result.delete("1.0", "end")
+            self.sql_result.insert("end", "錯誤: 僅允許 SELECT / PRAGMA / EXPLAIN 等唯讀查詢\n")
+            return
         try:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
