@@ -44,6 +44,18 @@ pyinstaller AI-Platform.spec
 
 輸出檔預設會在 `dist/`。
 
+### Bundled Tools
+
+- `AI-Platform.spec` 會自動打包 `skills/`、`vendor/`，以及存在時的 `tool_runtime/pandoc/`
+- 若要把 `pandoc` 一起打進 EXE，請先把 `pandoc.exe` 放到 `tool_runtime/pandoc/` 底下
+- `LibreOffice` 預設不隨專案一起打包，建議安裝到使用者系統，或在 app 的「系統環境設定」手動指定 `soffice.exe`
+
+### Office Dependency Strategy
+
+- `pandoc`：可隨 app 一起打包，執行時會優先搜尋使用者指定路徑，再搜尋系統 PATH、標準安裝目錄與 `tool_runtime/`
+- `LibreOffice / soffice`：不預設打包，執行時會優先搜尋使用者指定路徑，再搜尋系統 PATH 與常見安裝目錄
+- `pdftoppm`：可使用系統安裝的 Poppler，或在 app 的「系統環境設定」手動指定 `pdftoppm.exe`
+
 ## Project Files
 
 - `app.py`: 主程式與 UI

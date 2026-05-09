@@ -33,6 +33,7 @@ from knowledge import (
     backup_knowledge, build_knowledge_context, get_local_vector_stats,
     read_text_file, restore_knowledge, vectorize_knowledge_doc,
 )
+from office_tools import get_office_environment_status
 from skills import build_skill_context
 
 ctk.set_appearance_mode("dark")
@@ -351,7 +352,10 @@ class AIPlatformApp(ctk.CTk):
 
     def select_project(self, project):
         self.current_project = project
+        self.current_conversation = None
         self.refresh_project_sidebar()
+        self.update_project_display()
+        self.load_conversations()
 
     def refresh_project_sidebar(self):
         self.ensure_current_user()
@@ -376,10 +380,16 @@ class AIPlatformApp(ctk.CTk):
         self.btn_add_project.configure(state="normal")
 
         projects = get_projects(self.current_user[0])
+        project_was_none = self.current_project is None
         if self.current_project and self.current_project[0] not in [project[0] for project in projects]:
             self.current_project = None
+            project_was_none = True
         if not self.current_project and projects:
             self.current_project = projects[0]
+
+        if project_was_none and self.current_project:
+            self.current_conversation = None
+            self.load_conversations()
 
         if not projects:
             self.project_status_label.configure(text="尚未建立專案資料夾", text_color="#9f9f9f")
@@ -473,6 +483,8 @@ class AIPlatformApp(ctk.CTk):
                             )
                             file_item.pack(anchor="w", padx=24)
 
+        self.update_project_display()
+
     def add_project_folder_from_dialog(self):
         import tkinter.filedialog
 
@@ -493,6 +505,9 @@ class AIPlatformApp(ctk.CTk):
         except sqlite3.IntegrityError:
             self.project_status_label.configure(text="此專案資料夾已存在", text_color="orange")
         self.refresh_project_sidebar()
+        if self.current_project:
+            self.current_conversation = None
+            self.load_conversations()
 
     def get_provider_defaults(self, provider_type):
         defaults = {
@@ -565,7 +580,8 @@ class AIPlatformApp(ctk.CTk):
                 value.set(False)
         self.apply_history_panel_state()
         if self.current_user:
-            self.refresh_conversation_history_list(get_conversations(self.current_user[0]))
+            project_id = self.current_project[0] if self.current_project else None
+            self.refresh_conversation_history_list(get_conversations(self.current_user[0], project_id))
 
     def apply_history_panel_state(self):
         if hasattr(self, "history_toggle_button"):
@@ -633,11 +649,26 @@ class AIPlatformApp(ctk.CTk):
                 text_color="#b8b8b8",
             )
 
+    def update_project_display(self):
+        if not hasattr(self, "current_project_label"):
+            return
+
+        if self.current_project:
+            self.current_project_label.configure(
+                text=f"專案: {self.current_project[2]}",
+                text_color="#8fc9ff",
+            )
+        else:
+            self.current_project_label.configure(
+                text="",
+            )
+
     def open_conversation_by_id(self, conversation_id):
         if not self.current_user:
             return
 
-        conversations = get_conversations(self.current_user[0])
+        project_id = self.current_project[0] if self.current_project else None
+        conversations = get_conversations(self.current_user[0], project_id)
         target = next((conversation for conversation in conversations if conversation[0] == conversation_id), None)
         if not target:
             return
@@ -1034,16 +1065,20 @@ class AIPlatformApp(ctk.CTk):
                 textbox.configure(state="disabled")
                 continue
 
-            label = ctk.CTkLabel(
+            textbox = ctk.CTkTextbox(
                 parent,
-                text=self.clean_inline_markdown(block_text),
-                text_color=style["text_color"],
+                width=self.chat_content_width,
+                height=self.estimate_textbox_height(block_text, max_height=600),
+                wrap="word",
                 font=self.ui_font("chat_body"),
-                anchor="w",
-                justify="left",
-                wraplength=self.chat_text_wrap,
+                text_color=style["text_color"],
+                fg_color="transparent",
+                border_width=0,
+                corner_radius=0,
             )
-            label.pack(fill="x", padx=padx, pady=pady)
+            textbox.pack(fill="x", padx=padx, pady=pady)
+            textbox.insert("1.0", self.clean_inline_markdown(block_text))
+            textbox.configure(state="disabled")
 
     def normalize_chat_item(self, item, default_role="assistant", default_kind="message"):
         if isinstance(item, str):
@@ -1297,6 +1332,15 @@ class AIPlatformApp(ctk.CTk):
         )
         self.current_conversation_label.pack(side="left", padx=12, pady=8)
 
+        self.current_project_label = ctk.CTkLabel(
+            summary_frame,
+            text="",
+            anchor="w",
+            text_color="#8fc9ff",
+            font=self.ui_font("control", "bold"),
+        )
+        self.current_project_label.pack(side="right", padx=12, pady=8)
+
         history_frame = ctk.CTkFrame(self.main_frame)
         history_frame.pack(padx=20, pady=(0, 8), fill="x")
 
@@ -1415,9 +1459,14 @@ class AIPlatformApp(ctk.CTk):
         user_names = [user[1] for user in users]
         self.user_combo.configure(values=user_names if user_names else [""])
         if user_names:
-            selected_name = self.current_user[1] if self.current_user and self.current_user[1] in user_names else user_names[0]
+            current_name = self.current_user[1] if self.current_user and self.current_user[1] in user_names else None
+            selected_name = current_name or user_names[0]
             self.user_combo.set(selected_name)
-            self.on_user_changed()
+            if not current_name:
+                self.on_user_changed()
+            else:
+                self.refresh_project_sidebar()
+                self.load_conversations()
         else:
             self.user_combo.set("")
             self.current_user = None
@@ -1429,6 +1478,7 @@ class AIPlatformApp(ctk.CTk):
         selected_name = self.user_var.get()
         self.current_user = user_map.get(selected_name)
         self.current_project = None
+        self.current_conversation = None
         self.refresh_project_sidebar()
         self.load_conversations()
 
@@ -1442,7 +1492,8 @@ class AIPlatformApp(ctk.CTk):
                 self.clear_chat_display()
             return
 
-        conversations = get_conversations(self.current_user[0])
+        project_id = self.current_project[0] if self.current_project else None
+        conversations = get_conversations(self.current_user[0], project_id)
         conversation_titles = [conversation[2] for conversation in conversations]
 
         if selected_title and selected_title in conversation_titles:
@@ -1464,13 +1515,15 @@ class AIPlatformApp(ctk.CTk):
         if not self.current_user:
             return None
 
+        project_id = self.current_project[0] if self.current_project else None
         title = f"對話 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        conversation_id = create_conversation(self.current_user[0], title)
+        conversation_id = create_conversation(self.current_user[0], title, project_id)
         self.current_conversation = (
             conversation_id,
             self.current_user[0],
             title,
             datetime.now().isoformat(),
+            project_id,
         )
         self.load_conversations(selected_title=title)
         self.clear_chat_display()
@@ -1510,6 +1563,15 @@ class AIPlatformApp(ctk.CTk):
         message_text = self.get_input_text()
         if not message_text:
             return
+
+        if self.current_project and get_setting("allow_file_access", "0") != "1":
+            self.render_chat_item(
+                {
+                    "role": "system",
+                    "kind": "warning",
+                    "content": "目前已選擇專案資料夾，但檔案存取權限尚未開啟。請到「系統環境設定」開啟「允許模型讀寫本機檔案」。",
+                }
+            )
 
         if not self.current_conversation:
             self.new_conversation()
@@ -1560,33 +1622,41 @@ class AIPlatformApp(ctk.CTk):
             messages = [{"role": row[2], "content": row[3]} for row in message_rows]
             messages[-1]["content"] = user_content
             allow_file_access = get_setting("allow_file_access", "0") == "1"
-            if self.current_project and allow_file_access:
+            provider_supports_tools = provider[2] in ("OpenAI", "Custom", "LM Studio", "Azure OpenAI", "Ollama", "Anthropic", "Google Gemini")
+            can_access_files = allow_file_access and provider_supports_tools
+
+            if self.current_project:
+                project_name = self.current_project[2]
                 project_path = self.current_project[3]
-                messages.insert(
-                    0,
-                    {
-                        "role": "system",
-                        "content": (
-                            f"你有一個專案資料夾可供讀寫檔案：{project_path}\n"
-                            "使用者已授權你讀寫該資料夾中的檔案。"
-                            "當使用者要求建立、讀取、修改或刪除檔案時，請以該資料夾為工作目錄。"
-                            "回覆時可明確告知檔案的完整路徑。"
-                        ),
-                    },
-                )
-            elif self.current_project and not allow_file_access:
-                project_path = self.current_project[3]
-                messages.insert(
-                    0,
-                    {
-                        "role": "system",
-                        "content": (
-                            f"你有一個專案資料夾：{project_path}\n"
-                            "但目前檔案存取權限為關閉狀態，你無法讀寫該資料夾中的任何檔案。"
-                            "如果使用者要求你操作檔案，請告知對方需先在「系統環境設定」中開啟「允許模型讀寫本機檔案」。"
-                        ),
-                    },
-                )
+                if can_access_files:
+                    messages.insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": (
+                                f"你目前的工作專案為「{project_name}」，其 workspace 目錄為：{project_path}\n"
+                                "使用者已授權你讀寫該資料夾中的檔案。"
+                                "如果你支援工具調用（function calling / tool use），請優先使用工具，不要假裝已經執行。"
+                                "可用工具包含 read_file / write_file / list_files、run_project_python / run_project_node、read_office_skill_doc / get_office_environment_status / run_office_script。"
+                                "如果你的模型沒有原生工具調用能力，但需要操作檔案，請只輸出 JSON，不要附加其他文字。"
+                                "格式必須是 {\"name\":\"工具名稱\",\"parameters\":{\"path\":\"相對路徑\"}}。"
+                                "若要連續呼叫多個工具，可輸出 JSON 陣列。"
+                                "如果你不支援工具調用，請直接告知使用者你無法存取本機檔案系統。"
+                            ),
+                        },
+                    )
+                else:
+                    messages.insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": (
+                                f"你目前的工作專案為「{project_name}」，其 workspace 目錄為：{project_path}\n"
+                                "但目前你無法讀寫該資料夾中的任何檔案。"
+                                "如果使用者要求你操作檔案，請告知對方你無權限存取本機檔案系統。"
+                            ),
+                        },
+                    )
 
             skill_context = build_skill_context(message_text)
             if skill_context:
@@ -1612,7 +1682,7 @@ class AIPlatformApp(ctk.CTk):
                     },
                 )
 
-            if allow_file_access:
+            if can_access_files:
                 response = call_provider_with_tools(
                     provider[2], provider[4], provider[3], provider[5],
                     messages, TOOLS_SCHEMA,
@@ -1894,6 +1964,7 @@ class AIPlatformApp(ctk.CTk):
             onvalue=True,
             offvalue=False,
             font=self.ui_font("control"),
+            command=self.on_file_access_toggle_changed,
         )
         self.allow_file_access_toggle.pack(anchor="w", padx=14, pady=(0, 4))
 
@@ -1907,6 +1978,60 @@ class AIPlatformApp(ctk.CTk):
         )
         self.allow_file_access_note.pack(anchor="w", padx=14, pady=(0, 10))
 
+        office_frame = ctk.CTkFrame(tab_system_scroll)
+        office_frame.pack(padx=10, pady=(8, 10), fill="x")
+
+        ctk.CTkLabel(
+            office_frame,
+            text="Office 工具路徑",
+            font=self.ui_font("control", "bold"),
+        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w")
+
+        tool_rows = [
+            ("pandoc_path", "Pandoc", "pandoc.exe"),
+            ("soffice_path", "LibreOffice", "soffice.exe"),
+            ("pdftoppm_path", "Poppler", "pdftoppm.exe"),
+        ]
+        self.office_tool_path_vars = {}
+        for row_index, (setting_key, label, expected_name) in enumerate(tool_rows, start=1):
+            ctk.CTkLabel(office_frame, text=label, font=self.ui_font("control")).grid(
+                row=row_index,
+                column=0,
+                padx=10,
+                pady=5,
+                sticky="w",
+            )
+            path_var = ctk.StringVar(value=get_setting(setting_key, ""))
+            self.office_tool_path_vars[setting_key] = path_var
+            entry = ctk.CTkEntry(
+                office_frame,
+                width=360,
+                textvariable=path_var,
+                font=self.ui_font("control"),
+            )
+            entry.grid(row=row_index, column=1, padx=10, pady=5, sticky="ew")
+            browse_btn = ctk.CTkButton(
+                office_frame,
+                text="瀏覽",
+                width=72,
+                font=self.ui_font("control"),
+                command=lambda key=setting_key, name=expected_name: self.select_tool_executable_path(key, name),
+            )
+            browse_btn.grid(row=row_index, column=2, padx=(0, 10), pady=5, sticky="w")
+
+        office_frame.grid_columnconfigure(1, weight=1)
+
+        self.office_dependency_status = ctk.CTkLabel(
+            office_frame,
+            text="",
+            text_color="#a8a8a8",
+            font=self.ui_font("control"),
+            justify="left",
+            wraplength=720,
+        )
+        self.office_dependency_status.grid(row=4, column=0, columnspan=3, padx=10, pady=(6, 10), sticky="w")
+        self.refresh_office_dependency_status()
+
         btn_save_sys = ctk.CTkButton(
             tab_system_scroll,
             text="儲存系統環境設定",
@@ -1917,6 +2042,48 @@ class AIPlatformApp(ctk.CTk):
 
         self.refresh_provider_controls()
         self.apply_font_to_tree(notebook)
+
+    def select_tool_executable_path(self, setting_key, expected_name):
+        selected = filedialog.askopenfilename(
+            title=f"選擇 {expected_name}",
+            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+        )
+        if selected and setting_key in getattr(self, "office_tool_path_vars", {}):
+            self.office_tool_path_vars[setting_key].set(selected)
+
+    def refresh_office_dependency_status(self):
+        if not hasattr(self, "office_dependency_status"):
+            return
+        try:
+            status = get_office_environment_status()
+        except Exception as exc:
+            self.office_dependency_status.configure(
+                text=f"Office 工具檢查失敗: {exc}",
+                text_color="orange",
+            )
+            return
+
+        command_status = status.get("commands", {})
+        lines = []
+        for label, key in (("Pandoc", "pandoc"), ("LibreOffice", "soffice"), ("Poppler", "pdftoppm")):
+            path = command_status.get(key)
+            lines.append(f"{label}: {'已找到' if path else '未找到'}")
+            if path:
+                lines.append(f"  {path}")
+
+        blocking_scripts = [
+            script_id
+            for script_id, info in status.get("scripts", {}).items()
+            if not info.get("ready")
+        ]
+        color = "lightgreen" if not blocking_scripts else "#e8a000"
+        suffix = ""
+        if blocking_scripts:
+            suffix = f"\n受缺件影響的 Office 腳本: {', '.join(blocking_scripts)}"
+        self.office_dependency_status.configure(
+            text="\n".join(lines) + suffix,
+            text_color=color,
+        )
 
     def refresh_provider_controls(self):
         providers = get_providers()
@@ -2062,6 +2229,8 @@ class AIPlatformApp(ctk.CTk):
             "allow_file_access",
             "1" if self.allow_file_access_var.get() else "0",
         )
+        for setting_key, value_var in getattr(self, "office_tool_path_vars", {}).items():
+            save_setting(setting_key, value_var.get().strip())
         new_sizes = {}
         for key, default_size in UI_FONT_DEFAULTS.items():
             value_var = self.font_size_vars.get(key)
@@ -2097,8 +2266,22 @@ class AIPlatformApp(ctk.CTk):
             self.chat_width_var.set(str(chat_width))
         if hasattr(self, "chat_theme_var"):
             self.chat_theme_var.set(chat_theme)
+        self.refresh_office_dependency_status()
         if hasattr(self, "font_settings_status"):
             self.font_settings_status.configure(text="已儲存系統環境設定，UI 字體與對話區顯示已套用。", text_color="lightgreen")
+        self.refresh_project_sidebar()
+
+    def on_file_access_toggle_changed(self):
+        save_setting(
+            "allow_file_access",
+            "1" if self.allow_file_access_var.get() else "0",
+        )
+        self.refresh_project_sidebar()
+        if hasattr(self, "font_settings_status"):
+            if self.allow_file_access_var.get():
+                self.font_settings_status.configure(text="已開啟模型檔案存取。", text_color="lightgreen")
+            else:
+                self.font_settings_status.configure(text="已關閉模型檔案存取。", text_color="orange")
 
     def show_knowledge(self):
         self.current_view = "knowledge"

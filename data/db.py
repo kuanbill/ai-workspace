@@ -76,9 +76,14 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS conversations
            (id INTEGER PRIMARY KEY,
             user_id INTEGER,
+            project_id INTEGER,
             title TEXT,
             created_at TEXT)"""
     )
+    c.execute("PRAGMA table_info(conversations)")
+    existing_conv_columns = {row[1] for row in c.fetchall()}
+    if "project_id" not in existing_conv_columns:
+        c.execute("ALTER TABLE conversations ADD COLUMN project_id INTEGER")
     c.execute(
         """CREATE TABLE IF NOT EXISTS messages
            (id INTEGER PRIMARY KEY,
@@ -289,24 +294,28 @@ def add_project_folder(user_id: int, folder_path: str) -> int:
     return project_id
 
 
-def get_conversations(user_id: int):
+def get_conversations(user_id: int, project_id: int | None = None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "SELECT * FROM conversations WHERE user_id = ? ORDER BY created_at DESC",
-        (user_id,),
+    query = (
+        "SELECT id, user_id, title, created_at, project_id "
+        "FROM conversations WHERE user_id = ?"
     )
+    if project_id is not None:
+        c.execute(f"{query} AND project_id = ? ORDER BY created_at DESC", (user_id, project_id))
+    else:
+        c.execute(f"{query} AND project_id IS NULL ORDER BY created_at DESC", (user_id,))
     convs = c.fetchall()
     conn.close()
     return convs
 
 
-def create_conversation(user_id: int, title: str) -> int:
+def create_conversation(user_id: int, title: str, project_id: int | None = None) -> int:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO conversations (user_id, title, created_at) VALUES (?, ?, ?)",
-        (user_id, title, datetime.now().isoformat()),
+        "INSERT INTO conversations (user_id, project_id, title, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, project_id, title, datetime.now().isoformat()),
     )
     conv_id = c.lastrowid
     conn.commit()

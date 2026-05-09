@@ -12,11 +12,14 @@ env/
 # Build artifacts
 build/
 dist/
+build_tmp/
+dist_tmp/
 *.spec.bak
 
 # Local app data
 data/*.db
 knowledge_base/local_vectors.jsonl
+local_tools/
 
 # Local secrets
 .env
@@ -27,3 +30,6 @@ knowledge_base/local_vectors.jsonl
 Thumbs.db
 .vscode/
 .idea/
+
+# Bundled native modules committed under vendor/
+!vendor/**/*.pyd
