@@ -211,6 +211,7 @@ class AIPlatformApp(ctk.CTk):
 
         self.sidebar = ctk.CTkFrame(self, width=self.sidebar_width, corner_radius=0, fg_color="#171718")
         self.sidebar.grid(row=1, column=0, sticky="nsew")
+        self.sidebar.grid_columnconfigure(0, weight=1)
         self.sidebar.grid_rowconfigure(4, weight=1)
         self.sidebar.grid_propagate(False)
 
@@ -220,15 +221,6 @@ class AIPlatformApp(ctk.CTk):
             font=self.ui_font("sidebar_title", "bold"),
         )
         self.project_title.grid(row=0, column=0, padx=16, pady=(18, 8), sticky="w")
-
-        self.btn_refresh_sidebar = ctk.CTkButton(
-            self.sidebar,
-            text="↻",
-            width=36,
-            font=self.ui_font("control"),
-            command=self.refresh_project_sidebar,
-        )
-        self.btn_refresh_sidebar.grid(row=0, column=0, padx=(230, 8), pady=(18, 8), sticky="e")
 
         self.project_user_label = ctk.CTkLabel(
             self.sidebar,
