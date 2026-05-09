@@ -1050,6 +1050,51 @@ class AIPlatformApp(ctk.CTk):
                 )
                 cell_label.pack(fill="both", expand=True, padx=8, pady=7)
 
+    def _apply_markdown_tags(self, textbox, text, style):
+        textbox.insert("1.0", text)
+        
+        # 定義標籤樣式
+        font_body = self.ui_font("chat_body")
+        font_bold = self.ui_font("chat_body", "bold")
+        font_italic = ctk.CTkFont(family=font_body.family, size=font_body.size, slant="italic")
+        font_mono = ctk.CTkFont(family="Consolas", size=font_body.size)
+        font_header = self.ui_font("page_title", "bold")
+
+        textbox.tag_configure("bold", font=font_bold)
+        textbox.tag_configure("italic", font=font_italic)
+        textbox.tag_configure("mono", font=font_mono, background="#3a3a3c", foreground=style["text_color"])
+        textbox.tag_configure("header", font=font_header, foreground=style["header_color"])
+
+        # 1. 處理標題 (# Header) - 僅處理行首
+        for line in text.splitlines():
+            if line.startswith("# "):
+                start = "1.0" # 簡化處理，實際需計算行號
+                # 由於是在單一 textbox 中，這裡使用正則表達式更精確
+                pass
+        
+        # 使用正則表達式搜尋並標記
+        import re
+        
+        # 粗體 **text**
+        for match in re.finditer(r"\*\*(.*?)\*\*", text):
+            textbox.tag_add("bold", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
+            
+        # 斜體 *text*
+        for match in re.finditer(r"\*([^\*]+)\*", text):
+            textbox.tag_add("italic", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
+            
+        # 行內程式碼 `text`
+        for match in re.finditer(r"`([^`]+)`", text):
+            textbox.tag_add("mono", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
+
+        # 標題 (# ) - 簡單處理每行開頭
+        lines = text.split("\n")
+        current_pos = 0
+        for line in lines:
+            if line.startswith("# "):
+                textbox.tag_add("header", f"1.0 + {current_pos} chars", f"1.0 + {current_pos + len(line)} chars")
+            current_pos += len(line) + 1
+
     def render_text_content(self, parent, text, style, padx=14, pady=(0, 8)):
         for block_type, block_text in self.split_rich_text_blocks(text):
             if block_type == "table":
@@ -1057,23 +1102,32 @@ class AIPlatformApp(ctk.CTk):
                 continue
 
             if block_type == "mono":
-                textbox = ctk.CTkTextbox(
+                # 程式碼塊/運算式：使用深色背景容器
+                mono_frame = ctk.CTkFrame(
                     parent,
-                    width=self.chat_content_width,
-                    height=self.estimate_textbox_height(block_text),
-                    wrap="none",
-                    font=ctk.CTkFont(family="Consolas", size=self.ui_font_sizes.get("chat_body", 14)),
-                    text_color=style["text_color"],
                     fg_color="#171717",
                     border_color="#555555",
                     border_width=1,
                     corner_radius=8,
                 )
-                textbox.pack(fill="x", padx=padx, pady=pady)
-                textbox.insert("1.0", block_text)
-                textbox.configure(state="disabled")
+                mono_frame.pack(fill="x", padx=padx, pady=pady)
+                
+                mono_text = ctk.CTkTextbox(
+                    mono_frame,
+                    wrap="none",
+                    font=ctk.CTkFont(family="Consolas", size=self.ui_font_sizes.get("chat_body", 14)),
+                    text_color=style["text_color"],
+                    fg_color="transparent",
+                    border_width=0,
+                    corner_radius=0,
+                    height=self.estimate_textbox_height(block_text),
+                )
+                mono_text.pack(fill="x", padx=10, pady=10)
+                mono_text.insert("1.0", block_text)
+                mono_text.configure(state="disabled")
                 continue
 
+            # 一般文字：使用富文本渲染
             textbox = ctk.CTkTextbox(
                 parent,
                 width=self.chat_content_width,
@@ -1086,7 +1140,10 @@ class AIPlatformApp(ctk.CTk):
                 corner_radius=0,
             )
             textbox.pack(fill="x", padx=padx, pady=pady)
-            textbox.insert("1.0", self.clean_inline_markdown(block_text))
+            
+            # 應用 Markdown 標記
+            self._apply_markdown_tags(textbox, block_text, style)
+            
             textbox.configure(state="disabled")
 
     def normalize_chat_item(self, item, default_role="assistant", default_kind="message"):

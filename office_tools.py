@@ -322,6 +322,11 @@ def _run_command(command: list[str], cwd: str, timeout_seconds: int) -> dict:
     if VENDOR_DIR.exists():
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(VENDOR_DIR) if not existing else f"{VENDOR_DIR}{os.pathsep}{existing}"
+    
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NO_WINDOW
+
     completed = subprocess.run(
         command,
         cwd=cwd,
@@ -331,6 +336,7 @@ def _run_command(command: list[str], cwd: str, timeout_seconds: int) -> dict:
         errors="replace",
         timeout=timeout_seconds,
         env=env,
+        creationflags=creationflags,
     )
     return {
         "command": command,
