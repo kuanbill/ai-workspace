@@ -6,14 +6,13 @@ import re
 import shutil
 import sqlite3
 import threading
-from collections import defaultdict
+
 from datetime import datetime
 from tkinter import filedialog
+import tkinter as tk
 
 import customtkinter as ctk
 from PIL import Image
-
-import customtkinter as ctk
 
 from api_calls import call_provider, call_provider_with_tools, fetch_models_for_provider, provider_requires_api_key, verify_provider_config
 from tools import TOOLS_SCHEMA
@@ -108,6 +107,7 @@ class AIPlatformApp(ctk.CTk):
         self.current_view = "chat"
         self.font_size_vars = {}
         self.attachments = []
+        self.sidebar_width = 280
         self.load_ui_font_sizes()
         self.load_chat_display_settings()
 
@@ -143,6 +143,8 @@ class AIPlatformApp(ctk.CTk):
             self.project_status_label.configure(font=self.ui_font("sidebar_body"))
         if hasattr(self, "btn_add_project"):
             self.btn_add_project.configure(font=self.ui_font("control"))
+        if hasattr(self, "btn_reorg"):
+            self.btn_reorg.configure(font=self.ui_font("control"))
 
         if hasattr(self, "nav_frame"):
             for widget in self.nav_frame.winfo_children():
@@ -171,12 +173,15 @@ class AIPlatformApp(ctk.CTk):
 
     def setup_ui(self):
         self.grid_columnconfigure(0, weight=0)
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(1, weight=0)
+        self.grid_columnconfigure(2, weight=1)
+        self.grid_columnconfigure(0, minsize=self.sidebar_width)
+        self.grid_columnconfigure(1, minsize=6)
         self.grid_rowconfigure(0, weight=0)
         self.grid_rowconfigure(1, weight=1)
 
         self.topbar = ctk.CTkFrame(self, height=72, corner_radius=0, fg_color="#1b1b1d")
-        self.topbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.topbar.grid(row=0, column=0, columnspan=3, sticky="ew")
         self.topbar.grid_columnconfigure(1, weight=1)
 
         self.topbar_title = ctk.CTkLabel(
@@ -204,9 +209,9 @@ class AIPlatformApp(ctk.CTk):
         self.btn_tools = ctk.CTkButton(self.nav_frame, text="AI Tools", width=110, font=self.ui_font("nav"), command=self.show_tools)
         self.btn_tools.pack(side="left", padx=6)
 
-        self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color="#171718")
+        self.sidebar = ctk.CTkFrame(self, width=self.sidebar_width, corner_radius=0, fg_color="#171718")
         self.sidebar.grid(row=1, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(3, weight=1)
+        self.sidebar.grid_rowconfigure(4, weight=1)
         self.sidebar.grid_propagate(False)
 
         self.project_title = ctk.CTkLabel(
@@ -239,10 +244,18 @@ class AIPlatformApp(ctk.CTk):
             font=self.ui_font("control"),
             command=self.add_project_folder_from_dialog,
         )
-        self.btn_add_project.grid(row=2, column=0, padx=16, pady=(0, 12), sticky="ew")
+        self.btn_add_project.grid(row=2, column=0, padx=16, pady=(0, 6), sticky="ew")
+
+        self.btn_reorg = ctk.CTkButton(
+            self.sidebar,
+            text="檔案重整",
+            font=self.ui_font("control"),
+            command=self.reorganize_project_files,
+        )
+        self.btn_reorg.grid(row=3, column=0, padx=16, pady=(0, 12), sticky="ew")
 
         self.project_list_frame = ctk.CTkScrollableFrame(self.sidebar, corner_radius=10)
-        self.project_list_frame.grid(row=3, column=0, padx=12, pady=(0, 8), sticky="nsew")
+        self.project_list_frame.grid(row=4, column=0, padx=12, pady=(0, 8), sticky="nsew")
 
         self.project_status_label = ctk.CTkLabel(
             self.sidebar,
@@ -251,10 +264,15 @@ class AIPlatformApp(ctk.CTk):
             justify="left",
             font=self.ui_font("sidebar_body"),
         )
-        self.project_status_label.grid(row=4, column=0, padx=16, pady=(0, 16), sticky="ew")
+        self.project_status_label.grid(row=5, column=0, padx=16, pady=(0, 16), sticky="ew")
+
+        self.splitter = tk.Frame(self, width=6, cursor="sb_h_double_arrow", bg="#2a2a2c", bd=0, highlightthickness=0)
+        self.splitter.grid(row=1, column=1, sticky="ns")
+        self.splitter.bind("<ButtonPress-1>", self._start_split)
+        self._split_dragging = False
 
         self.main_frame = ctk.CTkFrame(self, corner_radius=0)
-        self.main_frame.grid(row=1, column=1, sticky="nsew")
+        self.main_frame.grid(row=1, column=2, sticky="nsew")
 
         self.show_chat()
         self.refresh_project_sidebar()
@@ -262,6 +280,28 @@ class AIPlatformApp(ctk.CTk):
     def clear_main(self):
         for widget in self.main_frame.winfo_children():
             widget.destroy()
+
+    def _start_split(self, event):
+        self._split_dragging = True
+        self._drag_start_x = event.x_root
+        self._sidebar_start_width = self.sidebar.winfo_width() or self.sidebar_width
+        self.bind("<B1-Motion>", self._drag_split)
+        self.bind("<ButtonRelease-1>", self._stop_split)
+
+    def _drag_split(self, event):
+        if not self._split_dragging:
+            return
+        delta = event.x_root - self._drag_start_x
+        new_width = max(150, min(600, self._sidebar_start_width + delta))
+        self.sidebar_width = new_width
+        self.sidebar.configure(width=new_width)
+        self.grid_columnconfigure(0, minsize=new_width)
+        self.update_idletasks()
+
+    def _stop_split(self, event):
+        self._split_dragging = False
+        self.unbind("<B1-Motion>")
+        self.unbind("<ButtonRelease-1>")
 
     def ensure_current_user(self):
         users = get_users()
@@ -288,67 +328,20 @@ class AIPlatformApp(ctk.CTk):
             else:
                 button.configure(fg_color=["#3a7ebf", "#1f538d"])
 
-    _file_categories = {
-        ".py": "Python",
-        ".js": "JavaScript",
-        ".ts": "TypeScript",
-        ".html": "HTML",
-        ".css": "CSS",
-        ".md": "Markdown",
-        ".txt": "Text",
-        ".json": "JSON",
-        ".csv": "CSV",
-        ".xml": "XML",
-        ".yaml": "YAML",
-        ".yml": "YAML",
-        ".toml": "TOML",
-        ".ini": "Config",
-        ".cfg": "Config",
-        ".env": "Env",
-        ".gitignore": "Git",
-        ".png": "Image",
-        ".jpg": "Image",
-        ".jpeg": "Image",
-        ".gif": "Image",
-        ".svg": "Image",
-        ".ico": "Image",
-        ".pdf": "PDF",
-        ".docx": "Word",
-        ".xlsx": "Excel",
-        ".pptx": "PowerPoint",
-        ".zip": "Archive",
-        ".tar": "Archive",
-        ".gz": "Archive",
-        ".exe": "Binary",
-        ".dll": "Binary",
-        ".so": "Binary",
-        ".sh": "Shell",
-        ".bat": "Batch",
-        ".ps1": "PowerShell",
-        ".sql": "SQL",
-        ".lock": "Lock",
-    }
 
     def _scan_project_files(self, folder_path):
-        categories = defaultdict(list)
-        others = []
+        files = []
         try:
             for entry in os.scandir(folder_path):
                 if entry.name.startswith("."):
                     continue
-                ext = os.path.splitext(entry.name)[1].lower()
-                cat = self._file_categories.get(ext, "其他")
                 if entry.is_dir():
-                    cat = "資料夾"
-                if cat == "其他":
-                    others.append(entry.name)
+                    files.append(f"📁 {entry.name}")
                 else:
-                    categories[cat].append(entry.name)
-            if others:
-                categories["其他"] = others
+                    files.append(entry.name)
         except Exception:
             pass
-        return dict(sorted(categories.items()))
+        return files
 
     def select_project(self, project):
         self.current_project = project
@@ -461,27 +454,18 @@ class AIPlatformApp(ctk.CTk):
                     )
                     lock_label.pack(anchor="w", padx=14, pady=(0, 8))
                 else:
-                    categories = self._scan_project_files(folder_path)
-                    for cat, files in categories.items():
-                        cat_label = ctk.CTkLabel(
+                    files = self._scan_project_files(folder_path)
+                    for fname in files:
+                        file_item = ctk.CTkLabel(
                             self.project_list_frame,
-                            text=f"▸ {cat} ({len(files)})",
-                            text_color="#a0c4e8",
-                            font=self.ui_font("sidebar_body"),
+                            text=fname,
+                            text_color="#c8c8c8",
+                            font=ctk.CTkFont(size=14),
+                            anchor="w",
+                            justify="left",
+                            wraplength=240,
                         )
-                        cat_label.pack(anchor="w", padx=16, pady=(4, 0))
-
-                        for fname in files:
-                            file_item = ctk.CTkLabel(
-                                self.project_list_frame,
-                                text=f"  {fname}",
-                                text_color="#c8c8c8",
-                                font=ctk.CTkFont(size=11),
-                                anchor="w",
-                                justify="left",
-                                wraplength=240,
-                            )
-                            file_item.pack(anchor="w", padx=24)
+                        file_item.pack(anchor="w", padx=16)
 
         self.update_project_display()
 
@@ -508,6 +492,39 @@ class AIPlatformApp(ctk.CTk):
         if self.current_project:
             self.current_conversation = None
             self.load_conversations()
+
+    def reorganize_project_files(self):
+        if not self.current_project:
+            self.project_status_label.configure(text="請先選擇一個專案", text_color="orange")
+            return
+        folder_path = self.current_project[3]
+        if not os.path.isdir(folder_path):
+            self.project_status_label.configure(text="專案資料夾不存在", text_color="orange")
+            return
+
+        import datetime
+        entries = []
+        for entry in os.scandir(folder_path):
+            if entry.name.startswith("."):
+                continue
+            mtime = datetime.datetime.fromtimestamp(entry.stat().st_mtime)
+            entries.append((entry.name, entry.is_dir(), mtime))
+
+        entries.sort(key=lambda e: (not e[1], e[0].lower()))
+        subfolders = [e for e in entries if e[1]]
+        files = [e for e in entries if not e[1]]
+
+        for idx, (name, is_dir, _) in enumerate(subfolders + files):
+            prefix = f"{idx+1:03d}_"
+            if not name.startswith(prefix):
+                new_name = prefix + name
+                try:
+                    os.rename(os.path.join(folder_path, name), os.path.join(folder_path, new_name))
+                except Exception:
+                    pass
+
+        self.project_status_label.configure(text="檔案重整完成", text_color="lightgreen")
+        self.refresh_project_sidebar()
 
     def get_provider_defaults(self, provider_type):
         defaults = {

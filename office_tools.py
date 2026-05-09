@@ -423,6 +423,12 @@ def run_office_script(project_root: str, script_id: str, paths: dict | None = No
         python_runtime = _find_command("python")
         if not python_runtime:
             return json.dumps({"error": "找不到可執行的 Python 環境"}, ensure_ascii=False)
+
+        if script_id in ("pptx_thumbnail", "xlsx_recalc"):
+            soffice_path = _find_command("soffice")
+            if soffice_path:
+                arg_list = ["--soffice-path", soffice_path] + list(arg_list)
+
         command = [python_runtime, str(script_spec["script"]), *path_args, *arg_list]
         result = _run_command(
             command,

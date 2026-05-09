@@ -86,6 +86,11 @@ def main():
         action="store_true",
         help="Outline text placeholders with a colored border",
     )
+    parser.add_argument(
+        "--soffice-path",
+        default=None,
+        help="Path to LibreOffice soffice executable",
+    )
 
     args = parser.parse_args()
 
@@ -119,7 +124,7 @@ def main():
                     print(f"Found placeholders on {len(placeholder_regions)} slides")
 
             # Convert slides to images
-            slide_images = convert_to_images(input_path, Path(temp_dir), CONVERSION_DPI)
+            slide_images = convert_to_images(input_path, Path(temp_dir), CONVERSION_DPI, soffice_cmd=args.soffice_path)
             if not slide_images:
                 print("Error: No slides found")
                 sys.exit(1)
@@ -194,7 +199,7 @@ def get_placeholder_regions(pptx_path):
     return placeholder_regions, (slide_width_inches, slide_height_inches)
 
 
-def convert_to_images(pptx_path, temp_dir, dpi):
+def convert_to_images(pptx_path, temp_dir, dpi, soffice_cmd=None):
     """Convert PowerPoint to images via PDF, handling hidden slides."""
     # Detect hidden slides
     print("Analyzing presentation...")
@@ -216,9 +221,10 @@ def convert_to_images(pptx_path, temp_dir, dpi):
 
     # Convert to PDF
     print("Converting to PDF...")
+    soffice_bin = soffice_cmd or "soffice"
     result = subprocess.run(
         [
-            "soffice",
+            soffice_bin,
             "--headless",
             "--convert-to",
             "pdf",
