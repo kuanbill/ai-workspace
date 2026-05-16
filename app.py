@@ -2,14 +2,25 @@ import base64
 import io
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
 import threading
+import traceback
 
 from datetime import datetime
 from tkinter import filedialog
 import tkinter as tk
+
+_DEBUG_LOG = os.environ.get("AI_DEBUG_LOG", os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ai_platform_debug.log"))
+
+def _debug_log(msg):
+    try:
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
 
 import customtkinter as ctk
 from PIL import Image
@@ -110,6 +121,9 @@ class AIPlatformApp(ctk.CTk):
         self.sidebar_width = 280
         self.load_ui_font_sizes()
         self.load_chat_display_settings()
+
+        self._api_result_queue = queue.Queue()
+        self.after(100, self._poll_api_results)
 
         self.setup_ui()
 
@@ -526,6 +540,7 @@ class AIPlatformApp(ctk.CTk):
             "Ollama": ("http://localhost:11434", "llama3.2"),
             "LM Studio": ("http://localhost:1234/v1", ""),
             "Azure OpenAI": ("https://your-resource.openai.azure.com", "gpt-4o-mini"),
+            "Nvidia": ("https://integrate.api.nvidia.com/v1", "nvidia/llama-3.1-nemotron-70b-instruct"),
             "Custom": ("", ""),
         }
         return defaults.get(provider_type, ("", ""))
@@ -886,10 +901,19 @@ class AIPlatformApp(ctk.CTk):
         self.msg_entry.configure(height=target_height)
 
     def on_input_return(self, event):
+        _debug_log("on_input_return called")
         if event.state & 0x0001:
+            _debug_log("shift+enter, returning None")
             return None
-
-        self.send_message()
+        try:
+            self.send_message()
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _debug_log(f"on_input_return exception: {exc}\n{tb}")
+            self.render_chat_item({
+                "role": "system", "kind": "error",
+                "content": f"send_message 錯誤: {exc}",
+            })
         return "break"
 
     def format_display_value(self, value):
@@ -1052,47 +1076,33 @@ class AIPlatformApp(ctk.CTk):
 
     def _apply_markdown_tags(self, textbox, text, style):
         textbox.insert("1.0", text)
+        tk_text = getattr(textbox, "_textbox", textbox)
         
-        # 定義標籤樣式
-        font_body = self.ui_font("chat_body")
+        fs = self.ui_font_sizes.get("chat_body", 14)
         font_bold = self.ui_font("chat_body", "bold")
-        font_italic = ctk.CTkFont(family=font_body.family, size=font_body.size, slant="italic")
-        font_mono = ctk.CTkFont(family="Consolas", size=font_body.size)
+        font_italic = ctk.CTkFont(size=fs, slant="italic")
+        font_mono = ctk.CTkFont(family="Consolas", size=fs)
         font_header = self.ui_font("page_title", "bold")
 
-        textbox.tag_configure("bold", font=font_bold)
-        textbox.tag_configure("italic", font=font_italic)
-        textbox.tag_configure("mono", font=font_mono, background="#3a3a3c", foreground=style["text_color"])
-        textbox.tag_configure("header", font=font_header, foreground=style["header_color"])
+        tk_text.tag_configure("bold", font=font_bold)
+        tk_text.tag_configure("italic", font=font_italic)
+        tk_text.tag_configure("mono", font=font_mono, background="#3a3a3c", foreground=style["text_color"])
+        tk_text.tag_configure("header", font=font_header, foreground=style["header_color"])
 
-        # 1. 處理標題 (# Header) - 僅處理行首
-        for line in text.splitlines():
-            if line.startswith("# "):
-                start = "1.0" # 簡化處理，實際需計算行號
-                # 由於是在單一 textbox 中，這裡使用正則表達式更精確
-                pass
-        
-        # 使用正則表達式搜尋並標記
-        import re
-        
-        # 粗體 **text**
         for match in re.finditer(r"\*\*(.*?)\*\*", text):
-            textbox.tag_add("bold", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
-            
-        # 斜體 *text*
-        for match in re.finditer(r"\*([^\*]+)\*", text):
-            textbox.tag_add("italic", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
-            
-        # 行內程式碼 `text`
-        for match in re.finditer(r"`([^`]+)`", text):
-            textbox.tag_add("mono", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
+            tk_text.tag_add("bold", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
 
-        # 標題 (# ) - 簡單處理每行開頭
+        for match in re.finditer(r"\*([^\*]+)\*", text):
+            tk_text.tag_add("italic", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
+
+        for match in re.finditer(r"`([^`]+)`", text):
+            tk_text.tag_add("mono", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
+
         lines = text.split("\n")
         current_pos = 0
         for line in lines:
             if line.startswith("# "):
-                textbox.tag_add("header", f"1.0 + {current_pos} chars", f"1.0 + {current_pos + len(line)} chars")
+                tk_text.tag_add("header", f"1.0 + {current_pos} chars", f"1.0 + {current_pos + len(line)} chars")
             current_pos += len(line) + 1
 
     def render_text_content(self, parent, text, style, padx=14, pady=(0, 8)):
@@ -1246,8 +1256,13 @@ class AIPlatformApp(ctk.CTk):
         style = dict(bubble_styles.get(role, bubble_styles["assistant"]))
         style.update(kind_overrides.get(kind, {}))
 
+        if kind == "status":
+            self._clear_status()
+
         row_frame = ctk.CTkFrame(self.chat_display, fg_color="transparent")
         row_frame.pack(fill="x", padx=10, pady=6)
+        if kind == "status":
+            self._last_status_frame = row_frame
 
         bubble_frame = ctk.CTkFrame(
             row_frame,
@@ -1611,61 +1626,69 @@ class AIPlatformApp(ctk.CTk):
             self.render_chat_item({"role": message[2], "content": message[3], "timestamp": message[4]})
 
     def send_message(self, event=None):
-        if not self.current_user:
-            self.render_chat_item({"role": "system", "kind": "warning", "content": "請先建立使用者"})
-            return
+        _debug_log("send_message called")
+        try:
+            if not self.current_user:
+                self.render_chat_item({"role": "system", "kind": "warning", "content": "請先建立使用者"})
+                return
 
-        provider = get_active_provider()
-        if not provider:
+            provider = get_active_provider()
+            if not provider:
+                self.render_chat_item(
+                    {
+                        "role": "system",
+                        "kind": "warning",
+                        "content": "請先到「系統環境設定」新增並驗證 API 供應商",
+                    }
+                )
+                return
+
+            message_text = self.get_input_text()
+            if not message_text:
+                return
+
+            attachments = list(self.attachments)
+            self.clear_input_text()
+
+            if self.current_project and get_setting("allow_file_access", "0") != "1":
+                self.render_chat_item(
+                    {
+                        "role": "system",
+                        "kind": "warning",
+                        "content": "目前已選擇專案資料夾，但檔案存取權限尚未開啟。請到「系統環境設定」開啟「允許模型讀寫本機檔案」。",
+                    }
+                )
+
+            if not self.current_conversation:
+                self.new_conversation()
+
+            if not self.current_conversation:
+                self.render_chat_item({"role": "system", "kind": "error", "content": "無法建立新對話，請重試"})
+                return
+
+            self.render_chat_item({"role": "user", "content": message_text, "attachments": attachments})
             self.render_chat_item(
                 {
-                    "role": "system",
-                    "kind": "warning",
-                    "content": "請先到「系統環境設定」新增並驗證 API 供應商",
+                    "role": "assistant",
+                    "kind": "status",
+                    "title": "處理中",
+                    "content": "正在產生回答。",
+                    "meta": {"provider": provider[1], "model": provider[5]},
                 }
             )
-            return
+            self.update()
 
-        message_text = self.get_input_text()
-        if not message_text:
-            return
-
-        if self.current_project and get_setting("allow_file_access", "0") != "1":
-            self.render_chat_item(
-                {
-                    "role": "system",
-                    "kind": "warning",
-                    "content": "目前已選擇專案資料夾，但檔案存取權限尚未開啟。請到「系統環境設定」開啟「允許模型讀寫本機檔案」。",
-                }
+            thread = threading.Thread(
+                target=self._do_api_call,
+                args=(provider, message_text, attachments),
+                daemon=True,
             )
-
-        if not self.current_conversation:
-            self.new_conversation()
-
-        if not self.current_conversation:
-            self.render_chat_item({"role": "system", "kind": "error", "content": "無法建立新對話，請重試"})
-            return
-
-        attachments = list(self.attachments)
-        self.render_chat_item({"role": "user", "content": message_text, "attachments": attachments})
-        self.clear_input_text()
-        self.render_chat_item(
-            {
-                "role": "assistant",
-                "kind": "status",
-                "title": "處理中",
-                "content": "正在產生回答。",
-                "meta": {"provider": provider[1], "model": provider[5]},
-            }
-        )
-        self.update()
-
-        thread = threading.Thread(
-            target=self._do_api_call,
-            args=(provider, message_text, attachments),
-            daemon=True,
-        )
-        thread.start()
+            thread.start()
+        except Exception as exc:
+            self.render_chat_item({
+                "role": "system", "kind": "error",
+                "content": f"send_message 錯誤: {exc}\n{type(exc).__name__}",
+            })
 
     def _build_multimodal_content(self, text, attachments):
         if not attachments:
@@ -1680,6 +1703,7 @@ class AIPlatformApp(ctk.CTk):
         return parts
 
     def _do_api_call(self, provider, message_text, attachments):
+        _debug_log(f"_do_api_call started: provider={provider[1] if provider else None}, msg_len={len(message_text)}")
         try:
             user_content = self._build_multimodal_content(message_text, attachments)
             save_message(self.current_conversation[0], "user", message_text)
@@ -1688,7 +1712,7 @@ class AIPlatformApp(ctk.CTk):
             messages = [{"role": row[2], "content": row[3]} for row in message_rows]
             messages[-1]["content"] = user_content
             allow_file_access = get_setting("allow_file_access", "0") == "1"
-            provider_supports_tools = provider[2] in ("OpenAI", "Custom", "LM Studio", "Azure OpenAI", "Ollama", "Anthropic", "Google Gemini")
+            provider_supports_tools = provider[2] in ("OpenAI", "Custom", "LM Studio", "Azure OpenAI", "Ollama", "Anthropic", "Google Gemini", "Nvidia")
             can_access_files = allow_file_access and provider_supports_tools
 
             if self.current_project:
@@ -1758,15 +1782,64 @@ class AIPlatformApp(ctk.CTk):
                     provider[2], provider[4], provider[3], provider[5],
                     messages,
                 )
-            self.after(0, self._handle_api_response, response, provider, knowledge_matches)
+            _debug_log(f"_do_api_call success, response len={len(response) if response else 0}")
+            self._api_result_queue.put({"type": "response", "response": response, "provider": provider, "matches": knowledge_matches})
         except Exception as exc:
-            self.after(0, self._render_api_error, str(exc), provider)
+            tb = traceback.format_exc()
+            _debug_log(f"_do_api_call exception: {exc}\n{tb}")
+            self._api_result_queue.put({"type": "error", "error": str(exc), "provider": provider})
+
+    def _clear_status(self):
+        if hasattr(self, "_last_status_frame") and self._last_status_frame:
+            try:
+                self._last_status_frame.destroy()
+            except Exception:
+                pass
+            self._last_status_frame = None
+
+    def _poll_api_results(self):
+        try:
+            while True:
+                item = self._api_result_queue.get_nowait()
+                _debug_log(f"_poll_api_results got item type={item['type']}")
+                try:
+                    if item["type"] == "response":
+                        self._handle_api_response(item["response"], item["provider"], item.get("matches", []))
+                    elif item["type"] == "error":
+                        self._render_api_error(item["error"], item["provider"])
+                except Exception as exc:
+                    tb = traceback.format_exc()
+                    _debug_log(f"_poll_api_results handler error: {exc}\n{tb}")
+                    self.render_chat_item({
+                        "role": "system", "kind": "error",
+                        "content": f"處理 API 回應時發生錯誤: {exc}",
+                    })
+        except queue.Empty:
+            pass
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _debug_log(f"_poll_api_results outer error: {exc}\n{tb}")
+            self.render_chat_item({
+                "role": "system", "kind": "error",
+                "content": f"輪詢佇列時發生錯誤: {exc}",
+            })
+        self.after(100, self._poll_api_results)
 
     def _handle_api_response(self, response, provider, knowledge_matches):
+        _debug_log(f"_handle_api_response called, response_len={len(response) if response else 0}")
+        self._clear_status()
+        if not self.current_conversation:
+            self.render_chat_item({
+                "role": "system", "kind": "warning",
+                "content": "API 回應已送達，但目前無有效對話可儲存。",
+            })
+            return
         self.render_chat_item(self.build_ai_response_item(response, provider))
         save_message(self.current_conversation[0], "assistant", response)
 
     def _render_api_error(self, error_text, provider):
+        _debug_log(f"_render_api_error called: {error_text[:200]}")
+        self._clear_status()
         self.render_chat_item(
             {
                 "role": "system",
@@ -1868,7 +1941,7 @@ class AIPlatformApp(ctk.CTk):
         ctk.CTkLabel(provider_frame, text="類型:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
         self.prov_type = ctk.CTkComboBox(
             provider_frame,
-            values=["OpenAI", "Google Gemini", "Anthropic", "Ollama", "LM Studio", "Azure OpenAI", "Custom"],
+            values=["OpenAI", "Google Gemini", "Anthropic", "Ollama", "LM Studio", "Azure OpenAI", "Nvidia", "Custom"],
             command=self.on_prov_type_changed,
             width=180,
         )
@@ -2607,12 +2680,14 @@ class AIPlatformApp(ctk.CTk):
         self.sql_result.pack(padx=20, pady=10, fill="both", expand=True)
 
     def _is_read_only_query(self, query: str) -> bool:
-        stripped = query.strip().upper()
+        stripped = query.strip()
         if not stripped:
             return False
-        if ";" in stripped.rstrip(";"):
+        cleaned = re.sub(r"--.*$", "", stripped, flags=re.MULTILINE)
+        tokens = cleaned.split()
+        if not tokens:
             return False
-        return stripped.startswith("SELECT") or stripped.startswith("PRAGMA") or stripped.startswith("EXPLAIN")
+        return tokens[0].upper() in ("SELECT", "PRAGMA", "EXPLAIN")
 
     def test_sql(self):
         query = self.sql_test.get().strip()

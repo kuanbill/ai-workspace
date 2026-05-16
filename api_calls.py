@@ -176,7 +176,7 @@ def call_openai(api_key: str, base_url: str, model: str, messages) -> str:
         return f"連線錯誤: {str(exc)}"
 
 
-def call_openai_with_tools(api_key: str, base_url: str, model: str, messages, tools, tool_handler) -> str:
+def call_openai_with_tools(api_key: str, base_url: str, model: str, messages, tools) -> str:
     from tools import handle_tool_call, _get_project_root
 
     headers = {"Content-Type": "application/json"}
@@ -583,7 +583,7 @@ def call_google_with_tools(api_key: str, base_url: str, model: str, messages, to
 
 
 def call_provider(api_type: str, api_key: str, base_url: str, model: str, messages) -> str:
-    if api_type in ("OpenAI", "Custom", "LM Studio"):
+    if api_type in ("OpenAI", "Custom", "LM Studio", "Nvidia"):
         return call_openai(api_key, base_url, model, messages)
     if api_type == "Azure OpenAI":
         return call_azure_openai(api_key, base_url, model, messages)
@@ -603,13 +603,13 @@ def _ensure_ollama_v1(base_url: str) -> str:
     return url
 
 
-def call_provider_with_tools(api_type: str, api_key: str, base_url: str, model: str, messages, tools, tool_handler=None) -> str:
-    if api_type in ("OpenAI", "Custom", "LM Studio", "Ollama"):
+def call_provider_with_tools(api_type: str, api_key: str, base_url: str, model: str, messages, tools) -> str:
+    if api_type in ("OpenAI", "Custom", "LM Studio", "Ollama", "Nvidia"):
         if api_type == "Ollama":
             base_url = _ensure_ollama_v1(base_url)
-        return call_openai_with_tools(api_key, base_url, model, messages, tools, tool_handler)
+        return call_openai_with_tools(api_key, base_url, model, messages, tools)
     if api_type == "Azure OpenAI":
-        return call_openai_with_tools(api_key, base_url, model, messages, tools, tool_handler)
+        return call_openai_with_tools(api_key, base_url, model, messages, tools)
     if api_type == "Anthropic":
         return call_anthropic_with_tools(api_key, model, messages, tools)
     if api_type == "Google Gemini":
@@ -639,7 +639,7 @@ def fetch_models_for_provider(api_type: str, api_key: str, base_url: str):
         return False, "請先輸入 Base URL", []
 
     try:
-        if api_type in ("OpenAI", "Custom", "LM Studio"):
+        if api_type in ("OpenAI", "Custom", "LM Studio", "Nvidia"):
             response = requests.get(
                 f"{normalize_base_url(base_url)}/models",
                 headers={"Authorization": f"Bearer {api_key}"},

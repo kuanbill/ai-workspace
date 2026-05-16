@@ -18,7 +18,9 @@ dist_tmp/
 
 # Local app data
 data/*.db
-knowledge_base/local_vectors.jsonl
+knowledge_base/
+land_admin_graph/
+land_admin_vector_db/
 local_tools/
 
 # Local secrets
